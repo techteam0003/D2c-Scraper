@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Dealer Inventory Scraper</title>
+<style>
+  :root {
+    --bg: #0f172a;
+    --panel: #1e293b;
+    --border: #334155;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --accent: #22c55e;
+    --accent2: #3b82f6;
+    --accent3: #a855f7;
+    --danger: #ef4444;
+    --warn: #eab308;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 32px 24px 80px;
+  }
+  .wrap { max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  .subtitle { color: var(--muted); margin-bottom: 24px; font-size: 14px; }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    margin-bottom: 20px;
+  }
+
+  label.small { font-size: 12px; color: var(--muted); display: block; margin-bottom: 6px; }
+
+  textarea {
+    width: 100%;
+    background: #0b1220;
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 12px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    min-height: 130px;
+    resize: vertical;
+  }
+
+  .row { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end; margin-top: 14px; }
+  input[type=number] {
+    background: #0b1220;
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 10px 12px;
+    border-radius: 8px;
+    font-size: 14px;
+    width: 90px;
+  }
+
+  button {
+    background: var(--accent2);
+    color: white;
+    border: none;
+    padding: 10px 18px;
+    border-radius: 8px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  button:hover { filter: brightness(1.1); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.download { background: var(--accent); }
+  button.download-csv { background: var(--accent3); }
+
+  .note { font-size: 12px; color: var(--muted); margin-top: 10px; }
+
+  .url-list { display: flex; flex-direction: column; gap: 10px; }
+  .url-row {
+    background: #0b1220;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+  }
+  .url-row-top { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+  .url-text { font-size: 13px; word-break: break-all; color: var(--text); }
+  .status-pill {
+    font-size: 11px;
+    padding: 2px 10px;
+    border-radius: 20px;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .status-pending { background: rgba(148,163,184,0.15); color: var(--muted); }
+  .status-running { background: rgba(59,130,246,0.15); color: #93c5fd; }
+  .status-done { background: rgba(34,197,94,0.15); color: #86efac; }
+  .status-error { background: rgba(239,68,68,0.15); color: #fca5a5; }
+  .platform-pill {
+    font-size: 11px;
+    padding: 2px 10px;
+    border-radius: 20px;
+    white-space: nowrap;
+    flex-shrink: 0;
+    background: rgba(168,85,247,0.15);
+    color: #d8b4fe;
+  }
+
+  .mini-progress-outer {
+    height: 6px;
+    background: #1e293b;
+    border-radius: 4px;
+    overflow: hidden;
+    margin-top: 8px;
+  }
+  .mini-progress-inner {
+    height: 100%;
+    width: 0%;
+    background: var(--accent2);
+    transition: width .2s ease;
+  }
+  .mini-label { font-size: 11px; color: var(--muted); margin-top: 4px; }
+
+  .overall-progress-outer {
+    height: 10px;
+    background: #0b1220;
+    border-radius: 6px;
+    overflow: hidden;
+    margin: 14px 0 6px;
+    border: 1px solid var(--border);
+  }
+  .overall-progress-inner {
+    height: 100%;
+    width: 0%;
+    background: var(--accent);
+    transition: width .2s ease;
+  }
+  .overall-label { font-size: 13px; color: var(--muted); }
+
+  #log {
+    background: #0b1220;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    height: 160px;
+    overflow-y: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    color: #a7f3d0;
+    margin-top: 14px;
+    white-space: pre-wrap;
+  }
+  #log .err { color: var(--danger); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { border-bottom: 1px solid var(--border); padding: 8px 10px; text-align: left; white-space: nowrap; }
+  th { color: var(--muted); position: sticky; top: 0; background: var(--panel); }
+  tbody tr:hover { background: rgba(255,255,255,0.03); }
+  .table-scroll { max-height: 500px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
+  a.veh-link { color: var(--accent2); text-decoration: none; }
+
+  .hidden { display: none; }
+  .badge {
+    display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 20px;
+    background: rgba(59,130,246,0.15); color: #93c5fd; margin-left: 8px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Dealer Inventory Scraper <span class="badge">multi-platform</span></h1>
+  <div class="subtitle">Paste one or more listing-page URLs (one per line). Each site's detail-page URL pattern
+    is auto-detected (SM360 classic "/used/...-idN.html", SM360 "/used-inventory/make/model/...-idN",
+    numeric-path platforms like garagetardif.com, or a generic "-idN" fallback). Results combine into one CSV or Excel file.</div>
+
+  <div class="panel">
+    <label class="small">Listing page URLs (one per line)</label>
+    <textarea id="urlInput" placeholder="https://www.hamelchevrolet.ca/en/used-inventory
+https://www.garagetardif.com/en/pre-owned
+https://www.hamelhonda.com/en/used-inventory/honda"></textarea>
+    <div class="row">
+      <div>
+        <label class="small">Max listing pages per URL</label>
+        <input type="number" id="maxPages" value="40" min="1" max="100">
+      </div>
+      <button id="scrapeBtn" onclick="startScrape()">Start Scraping</button>
+    </div>
+    <div class="note">Checking robots.txt / site terms for each domain is on you — this tool just automates the requests. Be reasonable with request volume, especially across many URLs.</div>
+  </div>
+
+  <div class="panel hidden" id="progressPanel">
+    <div class="overall-label" id="overallLabel">Starting…</div>
+    <div class="overall-progress-outer"><div class="overall-progress-inner" id="overallBar"></div></div>
+
+    <div class="url-list" id="urlList" style="margin-top:16px;"></div>
+
+    <div id="log"></div>
+  </div>
+
+  <div class="panel hidden" id="resultsPanel">
+    <div class="row" style="justify-content: space-between; margin-bottom: 14px;">
+      <div id="resultsSummary" style="font-size:14px;"></div>
+      <div style="display:flex; gap:10px;">
+        <button class="download-csv" id="downloadCsvBtn">Download CSV</button>
+        <button class="download" id="downloadBtn">Download Excel</button>
+      </div>
+    </div>
+    <div class="table-scroll">
+      <table id="resultsTable">
+        <thead>
+          <tr>
+            <th>Source</th><th>Platform</th><th>Title</th><th>Year</th><th>Make</th><th>Model</th><th>Trim</th>
+            <th>Price</th><th>Mileage</th><th>VIN</th><th>Stock #</th>
+            <th>Transmission</th><th>Ext. Colour</th><th>Link</th>
+          </tr>
+        </thead>
+        <tbody id="resultsBody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+let currentJobId = null;
+let urlRows = [];
+let platformByIndex = {};
+let urlByIndex = {};
+
+function logLine(text, isErr) {
+  const log = document.getElementById('log');
+  const line = document.createElement('div');
+  if (isErr) line.className = 'err';
+  line.textContent = text;
+  log.appendChild(line);
+  log.scrollTop = log.scrollHeight;
+}
+
+function buildUrlRows(urls) {
+  const container = document.getElementById('urlList');
+  container.innerHTML = '';
+  urlRows = [];
+  platformByIndex = {};
+  urlByIndex = {};
+  urls.forEach((url, i) => {
+    urlByIndex[i] = url;
+    const row = document.createElement('div');
+    row.className = 'url-row';
+    row.innerHTML = `
+      <div class="url-row-top">
+        <div class="url-text">${escapeHtml(url)}</div>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <div class="platform-pill hidden" id="platform-${i}"></div>
+          <div class="status-pill status-pending" id="status-${i}">pending</div>
+        </div>
+      </div>
+      <div class="mini-progress-outer"><div class="mini-progress-inner" id="bar-${i}"></div></div>
+      <div class="mini-label" id="label-${i}"></div>
+    `;
+    container.appendChild(row);
+    urlRows.push({url});
+  });
+}
+
+function setStatus(i, status) {
+  const el = document.getElementById('status-' + i);
+  if (!el) return;
+  el.textContent = status;
+  el.className = 'status-pill status-' + status;
+}
+
+function setPlatform(i, platform) {
+  const el = document.getElementById('platform-' + i);
+  if (!el) return;
+  el.textContent = platform;
+  el.classList.remove('hidden');
+  platformByIndex[i] = platform;
+}
+
+async function startScrape() {
+  const raw = document.getElementById('urlInput').value;
+  const urls = raw.split('\n').map(s => s.trim()).filter(Boolean);
+  if (urls.length === 0) { alert('Paste at least one URL first.'); return; }
+  const maxPages = document.getElementById('maxPages').value;
+
+  document.getElementById('scrapeBtn').disabled = true;
+  document.getElementById('progressPanel').classList.remove('hidden');
+  document.getElementById('resultsPanel').classList.add('hidden');
+  document.getElementById('log').innerHTML = '';
+  document.getElementById('overallBar').style.width = '0%';
+  document.getElementById('overallLabel').textContent = 'Starting…';
+  buildUrlRows(urls);
+
+  const resp = await fetch('/api/scrape', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({urls: urls, max_pages: maxPages})
+  });
+  const data = await resp.json();
+  if (data.error) {
+    logLine('Error: ' + data.error, true);
+    document.getElementById('scrapeBtn').disabled = false;
+    return;
+  }
+  currentJobId = data.job_id;
+  logLine(`Job started for ${data.urls.length} URL(s).`);
+
+  const evtSource = new EventSource('/api/stream/' + currentJobId);
+  evtSource.onmessage = function(event) {
+    const item = JSON.parse(event.data);
+
+    if (item.type === 'url_start') {
+      setStatus(item.url_index, 'running');
+      document.getElementById('overallLabel').textContent =
+        `Scraping URL ${item.overall_index} of ${item.overall_total}`;
+      const pct = Math.round(((item.overall_index - 1) / item.overall_total) * 100);
+      document.getElementById('overallBar').style.width = pct + '%';
+
+    } else if (item.type === 'log') {
+      logLine(`[URL ${item.url_index + 1}] ${item.message}`, item.is_err);
+      const m = item.message.match(/^Detected platform:\s*([a-z0-9\-]+)/i);
+      if (m) setPlatform(item.url_index, m[1]);
+
+    } else if (item.type === 'progress') {
+      const pct = item.total ? Math.round((item.current / item.total) * 100) : 0;
+      const bar = document.getElementById('bar-' + item.url_index);
+      const label = document.getElementById('label-' + item.url_index);
+      if (bar) bar.style.width = pct + '%';
+      if (label) label.textContent = `${item.current} / ${item.total} vehicles scraped`;
+
+    } else if (item.type === 'url_done') {
+      setStatus(item.url_index, item.count > 0 ? 'done' : 'error');
+      if (item.platform) setPlatform(item.url_index, item.platform);
+      const label = document.getElementById('label-' + item.url_index);
+      if (label) label.textContent = `Done — ${item.count} vehicles found`;
+
+    } else if (item.type === 'done') {
+      evtSource.close();
+      document.getElementById('scrapeBtn').disabled = false;
+      document.getElementById('overallBar').style.width = '100%';
+      document.getElementById('overallLabel').textContent =
+        item.total_count > 0 ? `All done — ${item.total_count} vehicles total.` : 'All done — no vehicles found.';
+      if (item.total_count > 0) {
+        loadResults(currentJobId);
+      }
+    }
+  };
+  evtSource.onerror = function() {
+    logLine('Connection to server lost.', true);
+    evtSource.close();
+    document.getElementById('scrapeBtn').disabled = false;
+  };
+}
+
+async function loadResults(jobId) {
+  const resp = await fetch('/api/results/' + jobId);
+  const data = await resp.json();
+  const vehicles = data.vehicles || [];
+
+  const platformBySource = {};
+  (data.summary || []).forEach(s => { platformBySource[s.url] = s.platform; });
+
+  document.getElementById('resultsPanel').classList.remove('hidden');
+  const urlCount = data.summary.length;
+  document.getElementById('resultsSummary').textContent =
+    `${vehicles.length} vehicles total, from ${urlCount} URL(s)`;
+
+  const body = document.getElementById('resultsBody');
+  body.innerHTML = '';
+  for (const v of vehicles) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${escapeHtml(v.domain)}</td>
+      <td>${escapeHtml(platformBySource[v.source_url] || '')}</td>
+      <td>${escapeHtml(v.title)}</td>
+      <td>${escapeHtml(v.year)}</td>
+      <td>${escapeHtml(v.make)}</td>
+      <td>${escapeHtml(v.model)}</td>
+      <td>${escapeHtml(v.trim)}</td>
+      <td>${escapeHtml(v.price)}</td>
+      <td>${escapeHtml(v.mileage)}</td>
+      <td>${escapeHtml(v.vin)}</td>
+      <td>${escapeHtml(v.stock_number || v.stock_id)}</td>
+      <td>${escapeHtml(v.transmission)}</td>
+      <td>${escapeHtml(v.exterior_color)}</td>
+      <td><a class="veh-link" href="${v.url}" target="_blank">view</a></td>
+    `;
+    body.appendChild(tr);
+  }
+
+  document.getElementById('downloadBtn').onclick = () => {
+    window.location.href = '/api/download/' + jobId;
+  };
+  document.getElementById('downloadCsvBtn').onclick = () => {
+    window.location.href = '/api/download_csv/' + jobId;
+  };
+}
+
+function escapeHtml(str) {
+  if (str === undefined || str === null) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+</script>
+</body>
+</html>
