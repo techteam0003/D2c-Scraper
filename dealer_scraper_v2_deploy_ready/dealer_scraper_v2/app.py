@@ -551,10 +551,13 @@ def api_stream(job_id):
     def generate():
         q = JOBS[job_id]["queue"]
         while True:
-            item = q.get()
-            yield f"data: {json.dumps(item)}\n\n"
-            if item.get("type") == "done":
-                break
+            try:
+                item = q.get(timeout=10)
+                yield f"data: {json.dumps(item)}\n\n"
+                if item.get("type") == "done":
+                    break
+            except queue.Empty:
+                yield f"data: {json.dumps({'type': 'ping'})}\n\n"
 
     return Response(generate(), mimetype="text/event-stream")
 
