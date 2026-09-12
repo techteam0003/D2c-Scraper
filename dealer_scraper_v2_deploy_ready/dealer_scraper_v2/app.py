@@ -551,13 +551,10 @@ def api_stream(job_id):
     def generate():
         q = JOBS[job_id]["queue"]
         while True:
-            try:
-                item = q.get(timeout=10)
-                yield f"data: {json.dumps(item)}\n\n"
-                if item.get("type") == "done":
-                    break
-            except queue.Empty:
-                yield f"data: {json.dumps({'type': 'ping'})}\n\n"
+            item = q.get()
+            yield f"data: {json.dumps(item)}\n\n"
+            if item.get("type") == "done":
+                break
 
     return Response(generate(), mimetype="text/event-stream")
 
@@ -703,7 +700,4 @@ def api_download_csv(job_id):
 
 
 if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 5000))
-    debug = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
-    app.run(host="0.0.0.0", port=port, debug=debug)
+    app.run(debug=True, port=5000)
