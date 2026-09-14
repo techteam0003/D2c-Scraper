@@ -40,6 +40,7 @@ rest of the pipeline.
 import csv
 import io
 import json
+import os
 import queue
 import re
 import threading
@@ -56,6 +57,44 @@ from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font
 
 app = Flask(__name__)
+
+# --------------------------------------------------------------------------
+# INVENTORY DASHBOARD INTEGRATION
+# --------------------------------------------------------------------------
+# The DreamTech Master Scraper dashboard is a frontend-only app, so it cannot
+# receive a push from this server. Instead this scraper keeps each finished
+# job in memory (JOBS, already used for CSV/Excel downloads) and exposes it at
+#     GET /api/inventory/<job_id>
+# The "Send to Inventory" button opens the dashboard with ?import=<job_id>,
+# and the dashboard pulls the data from that endpoint.
+#
+# Override the dashboard address without editing code by setting the
+# DASHBOARD_URL environment variable (on Render: Settings -> Environment).
+# --------------------------------------------------------------------------
+DASHBOARD_URL = os.environ.get(
+    "DASHBOARD_URL", "https://dreamtech-master-scraper.ai.studio"
+).rstrip("/")
+
+# Browsers block cross-site fetches unless the server says otherwise. These are
+# the origins allowed to read /api/* responses.
+ALLOWED_ORIGINS = {
+    DASHBOARD_URL,
+    "http://localhost:3000",
+    "http://localhost:5173",
+}
+
+
+@app.after_request
+def _allow_dashboard_cors(resp):
+    if request.path.startswith("/api/"):
+        origin = request.headers.get("Origin", "")
+        if origin in ALLOWED_ORIGINS:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Vary"] = "Origin"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+            resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return resp
+
 
 HEADERS = {
     "User-Agent": (
@@ -506,9 +545,103 @@ def run_batch_job(job_id: str, urls: list, max_pages: int):
     q.put({"type": "done", "total_count": total_count})
 
 
+# --------------------------------------------------------------------------
+# "Send to Inventory" button.
+# Injected into index.html at render time so templates/index.html needs no
+# edits. It wraps window.fetch to notice the job_id returned by /api/scrape,
+# polls until the job reports "done", then enables the button.
+# --------------------------------------------------------------------------
+INVENTORY_BUTTON_SNIPPET = """
+<style>
+  #dt-inv-bar { position: fixed; right: 18px; bottom: 18px; z-index: 99999;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    text-align: right; }
+  #dt-inv-btn { padding: 12px 20px; border: 0; border-radius: 8px;
+    background: #16a34a; color: #fff; font-size: 15px; font-weight: 600;
+    cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,.25); }
+  #dt-inv-btn:hover:not([disabled]) { background: #15803d; }
+  #dt-inv-btn[disabled] { background: #9ca3af; cursor: not-allowed;
+    box-shadow: none; }
+  #dt-inv-note { margin-top: 6px; font-size: 12px; color: #4b5563; }
+</style>
+<div id="dt-inv-bar" style="display:none">
+  <button id="dt-inv-btn" disabled>Send to Inventory</button>
+  <div id="dt-inv-note"></div>
+</div>
+<script>
+(function () {
+  var DASHBOARD = "__DASHBOARD_URL__";
+  var jobId = null, ready = false, poller = null;
+
+  var bar  = document.getElementById("dt-inv-bar");
+  var btn  = document.getElementById("dt-inv-btn");
+  var note = document.getElementById("dt-inv-note");
+
+  function watch(id) {
+    if (poller) { clearInterval(poller); poller = null; }
+    jobId = id;
+    ready = false;
+    bar.style.display = "block";
+    btn.disabled = true;
+    note.textContent = "Scraping running...";
+
+    poller = setInterval(function () {
+      fetch("/api/inventory/" + id)
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (d.status === "done") {
+            clearInterval(poller); poller = null;
+            ready = d.count > 0;
+            btn.disabled = !ready;
+            note.textContent = d.count
+              ? d.count + " vehicles ready to send"
+              : "No vehicles found";
+          } else {
+            note.textContent = d.count + " vehicles so far...";
+          }
+        })
+        .catch(function () {});
+    }, 3000);
+  }
+
+  // The page's own script POSTs to /api/scrape; grab the job_id it returns.
+  var origFetch = window.fetch;
+  window.fetch = function () {
+    var args = arguments;
+    var p = origFetch.apply(this, args);
+    try {
+      var u = typeof args[0] === "string" ? args[0] : (args[0] && args[0].url) || "";
+      if (u.indexOf("/api/scrape") !== -1) {
+        p.then(function (res) {
+          res.clone().json().then(function (d) {
+            if (d && d.job_id) watch(d.job_id);
+          }).catch(function () {});
+        }).catch(function () {});
+      }
+    } catch (e) {}
+    return p;
+  };
+
+  btn.onclick = function () {
+    if (!jobId || !ready) return;
+    window.open(
+      DASHBOARD + "/?import=" + encodeURIComponent(jobId) +
+      "&src=" + encodeURIComponent(window.location.origin),
+      "_blank"
+    );
+  };
+})();
+</script>
+"""
+
+
 @app.route("/")
 def index():
-    return render_template("index.html")
+    html = render_template("index.html")
+    snippet = INVENTORY_BUTTON_SNIPPET.replace("__DASHBOARD_URL__", DASHBOARD_URL)
+    if "</body>" in html:
+        return html.replace("</body>", snippet + "</body>", 1)
+    return html + snippet
 
 
 @app.route("/api/scrape", methods=["POST"])
@@ -581,6 +714,36 @@ def api_results(job_id):
         "status": job["status"],
         "summary": summary,
         "vehicles": all_vehicles,
+    })
+
+
+@app.route("/api/inventory/<job_id>")
+def api_inventory(job_id):
+    """Payload consumed by the DreamTech inventory dashboard.
+
+    Same vehicles as /api/results, but duplicates are collapsed on VIN
+    (falling back to the detail-page URL when a VIN is missing) so re-scraping
+    the same dealer updates rows instead of piling up copies.
+    """
+    job = JOBS.get(job_id)
+    if not job:
+        return jsonify({"error": "Unknown job"}), 404
+
+    deduped = {}
+    for uj in job["url_jobs"]:
+        for v in uj["vehicles"]:
+            d = asdict(v)
+            key = (d.get("vin") or "").strip().upper() or d.get("url")
+            deduped[key] = d
+
+    items = list(deduped.values())
+    return jsonify({
+        "job_id": job_id,
+        "status": job["status"],
+        "count": len(items),
+        "fields": CSV_FIELDNAMES,
+        "dedupe_key": "vin",
+        "items": items,
     })
 
 
@@ -700,4 +863,7 @@ def api_download_csv(job_id):
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    # Render supplies PORT; locally it falls back to 5000.
+    port = int(os.environ.get("PORT", 5000))
+    debug = os.environ.get("FLASK_DEBUG", "1") == "1"
+    app.run(debug=debug, host="0.0.0.0", port=port)
