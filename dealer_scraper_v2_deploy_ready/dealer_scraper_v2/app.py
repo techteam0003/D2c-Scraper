@@ -624,11 +624,14 @@ INVENTORY_BUTTON_SNIPPET = """
 
   btn.onclick = function () {
     if (!jobId || !ready) return;
-    window.open(
+    // A named window (instead of "_blank") reuses the same inventory tab on
+    // every send, so repeated scrapes don't pile up browser tabs.
+    var tab = window.open(
       DASHBOARD + "/?import=" + encodeURIComponent(jobId) +
       "&src=" + encodeURIComponent(window.location.origin),
-      "_blank"
+      "dreamtech_inventory"
     );
+    if (tab) tab.focus();
   };
 })();
 </script>
