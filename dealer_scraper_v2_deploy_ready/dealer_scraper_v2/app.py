@@ -35,13 +35,27 @@ detail-URL patterns against each listing page and uses whichever one
 actually finds vehicle links -- logging which "platform" it detected.
 New patterns can be added to DETAIL_URL_PATTERNS without touching the
 rest of the pipeline.
+
+CONCURRENCY NOTES (multiple users at the same time)
+---------------------------------------------------
+* JOBS lives in memory, so gunicorn must run with ONE worker process
+  (--workers 1) and many threads. With 2+ workers, /api/stream or
+  /api/results can land on a process that never saw the job -> 404.
+* Each job keeps a list of events instead of a single Queue, so any
+  number of browser streams (including EventSource auto-reconnects) can
+  read the same job without stealing each other's messages, and no
+  stream thread can get stuck forever waiting on an empty queue.
+* Streams send a keep-alive ping every 15s and stop as soon as the job
+  is finished or removed, so server threads are always freed.
+* HTML is parsed with lxml (much faster than html.parser), so one
+  user's scrape no longer eats all the CPU on a small server.
+* Old finished jobs are cleaned up so memory does not grow forever.
 """
 
 import csv
 import io
 import json
 import os
-import queue
 import re
 import threading
 import time
@@ -50,11 +64,19 @@ from dataclasses import dataclass, asdict, fields
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, SoupStrainer
 from flask import Flask, Response, jsonify, render_template, request, send_file
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font
+
+# lxml is a C parser, many times faster than Python's html.parser. Falls back
+# automatically if it isn't installed.
+try:
+    import lxml  # noqa: F401
+    HTML_PARSER = "lxml"
+except ImportError:
+    HTML_PARSER = "html.parser"
 
 app = Flask(__name__)
 
@@ -107,6 +129,11 @@ REQUEST_DELAY = 1.2
 REQUEST_TIMEOUT = 15
 DEFAULT_MAX_PAGES = 40
 
+# How long a finished job stays in memory (for downloads / dashboard import).
+JOB_TTL_SECONDS = int(os.environ.get("JOB_TTL_SECONDS", 3 * 60 * 60))
+# How often an open stream sends a keep-alive ping while waiting.
+STREAM_PING_SECONDS = 15
+
 # --------------------------------------------------------------------------
 # Platform detection: each entry is (platform_name, compiled_regex).
 # The regex must have its first capturing group be the numeric stock/listing
@@ -147,12 +174,41 @@ CSV_FIELDNAMES = [
 ]
 
 # job_id -> {
-#   "queue": Queue,
+#   "events": [ {...}, ... ],        # every message ever sent for this job
+#   "cond": threading.Condition(),    # wakes up streams when events arrive
 #   "status": "running|done|error",
+#   "created": float, "finished": float|None,
 #   "url_jobs": [ {"url":..., "domain":..., "status":..., "platform":...,
 #                  "vehicles":[...]} , ... ],
 # }
 JOBS = {}
+JOBS_LOCK = threading.Lock()
+
+
+def push_event(job_id: str, item: dict):
+    """Append an event to a job and wake every stream watching it."""
+    job = JOBS.get(job_id)
+    if not job:
+        return
+    with job["cond"]:
+        job["events"].append(item)
+        job["cond"].notify_all()
+
+
+def cleanup_old_jobs():
+    """Drop finished jobs older than JOB_TTL_SECONDS so memory stays flat."""
+    now = time.time()
+    with JOBS_LOCK:
+        stale = [
+            jid for jid, j in JOBS.items()
+            if j.get("finished") and now - j["finished"] > JOB_TTL_SECONDS
+        ]
+        for jid in stale:
+            job = JOBS.pop(jid, None)
+            if job:
+                # wake any stream still attached so it can exit
+                with job["cond"]:
+                    job["cond"].notify_all()
 
 
 @dataclass
@@ -190,9 +246,10 @@ def normalize_url(raw: str) -> str:
     return raw
 
 
-def get(url: str):
+def get(url: str, session=None):
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        requester = session or requests
+        resp = requester.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 200:
             return resp
         return None
@@ -200,12 +257,17 @@ def get(url: str):
         return None
 
 
+def _all_hrefs(html: str):
+    """Parse ONLY <a> tags -- much cheaper than building the whole tree."""
+    soup = BeautifulSoup(html, HTML_PARSER, parse_only=SoupStrainer("a"))
+    return [a["href"] for a in soup.find_all("a", href=True)]
+
+
 def detect_platform_and_links(html: str, base_url: str):
     """Try each known detail-URL pattern in order. Returns
     (platform_name, regex, set_of_absolute_urls) for the first pattern
     that finds at least one match, or (None, None, set()) if none do."""
-    soup = BeautifulSoup(html, "html.parser")
-    hrefs = [a["href"] for a in soup.find_all("a", href=True)]
+    hrefs = _all_hrefs(html)
     for name, pattern in DETAIL_URL_PATTERNS:
         links = {urljoin(base_url, h) for h in hrefs if pattern.search(h)}
         if links:
@@ -214,13 +276,7 @@ def detect_platform_and_links(html: str, base_url: str):
 
 
 def find_detail_links_with_pattern(html: str, base_url: str, pattern) -> set:
-    soup = BeautifulSoup(html, "html.parser")
-    links = set()
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if pattern.search(href):
-            links.add(urljoin(base_url, href))
-    return links
+    return {urljoin(base_url, h) for h in _all_hrefs(html) if pattern.search(h)}
 
 
 def stock_id_from_url(url: str, pattern) -> str:
@@ -339,7 +395,7 @@ def _na(value):
 
 def parse_detail_page(html: str, url: str, domain: str, source_url: str,
                        detail_pattern) -> Vehicle:
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, HTML_PARSER)
     v = Vehicle(source_url=source_url, domain=domain, url=url)
     v.stock_id = stock_id_from_url(url, detail_pattern)
     text = soup.get_text(" ", strip=True)
@@ -455,94 +511,104 @@ def scrape_one_url(source_url: str, max_pages: int, log_fn, progress_fn) -> tupl
     domain = urlparse(source_url).netloc
     vehicles = []
 
-    log_fn(f"Fetching listing page: {source_url}")
-    resp = get(source_url)
-    time.sleep(REQUEST_DELAY)
-    if resp is None:
-        log_fn(f"Could not fetch {source_url} (site unreachable or non-200 response).", is_err=True)
-        return None, vehicles
-
-    platform, pattern, links = detect_platform_and_links(resp.text, source_url)
-    if not links:
-        log_fn("No vehicle links found on this page with any known platform "
-               "pattern (SM360 .html, SM360 inventory-path, syncauto numeric-path, "
-               "generic -idNNNN). This site may use a platform this tool doesn't "
-               "recognize yet -- inspect a vehicle detail-page URL manually and "
-               "add a pattern to DETAIL_URL_PATTERNS in app.py.", is_err=True)
-        return None, vehicles
-
-    log_fn(f"Detected platform: {platform} — found {len(links)} vehicle link(s) on the first page.")
-
-    # paginate, preserving other query params, trying each page-param name
-    for param in PAGE_PARAM_CANDIDATES:
-        stagnant = 0
-        found_any_for_param = False
-        for page_num in range(2, max_pages + 1):
-            page_url = build_page_url(source_url, param, page_num)
-            resp = get(page_url)
-            time.sleep(REQUEST_DELAY)
-            if resp is None:
-                break
-            new_links = find_detail_links_with_pattern(resp.text, page_url, pattern)
-            before = len(links)
-            links |= new_links
-            if len(links) == before:
-                stagnant += 1
-                if stagnant >= 2:
-                    break
-            else:
-                found_any_for_param = True
-                log_fn(f"Page {page_num} ({param}={page_num}): {len(links)} total vehicle links so far")
-                stagnant = 0
-        if found_any_for_param:
-            break
-
-    log_fn(f"Total unique vehicle pages to scrape: {len(links)}")
-
-    links_sorted = sorted(links)
-    total = len(links_sorted)
-    for i, url in enumerate(links_sorted, 1):
-        resp = get(url)
+    # One Session per URL: reuses the TCP/TLS connection to the dealer site
+    # instead of doing a fresh (CPU-heavy) TLS handshake on every request.
+    with requests.Session() as session:
+        log_fn(f"Fetching listing page: {source_url}")
+        resp = get(source_url, session)
         time.sleep(REQUEST_DELAY)
-        if resp is not None:
-            v = parse_detail_page(resp.text, url, domain, source_url, pattern)
-            vehicles.append(v)
-        progress_fn(i, total)
+        if resp is None:
+            log_fn(f"Could not fetch {source_url} (site unreachable or non-200 response).", is_err=True)
+            return None, vehicles
+
+        platform, pattern, links = detect_platform_and_links(resp.text, source_url)
+        if not links:
+            log_fn("No vehicle links found on this page with any known platform "
+                   "pattern (SM360 .html, SM360 inventory-path, syncauto numeric-path, "
+                   "generic -idNNNN). This site may use a platform this tool doesn't "
+                   "recognize yet -- inspect a vehicle detail-page URL manually and "
+                   "add a pattern to DETAIL_URL_PATTERNS in app.py.", is_err=True)
+            return None, vehicles
+
+        log_fn(f"Detected platform: {platform} — found {len(links)} vehicle link(s) on the first page.")
+
+        # paginate, preserving other query params, trying each page-param name
+        for param in PAGE_PARAM_CANDIDATES:
+            stagnant = 0
+            found_any_for_param = False
+            for page_num in range(2, max_pages + 1):
+                page_url = build_page_url(source_url, param, page_num)
+                resp = get(page_url, session)
+                time.sleep(REQUEST_DELAY)
+                if resp is None:
+                    break
+                new_links = find_detail_links_with_pattern(resp.text, page_url, pattern)
+                before = len(links)
+                links |= new_links
+                if len(links) == before:
+                    stagnant += 1
+                    if stagnant >= 2:
+                        break
+                else:
+                    found_any_for_param = True
+                    log_fn(f"Page {page_num} ({param}={page_num}): {len(links)} total vehicle links so far")
+                    stagnant = 0
+            if found_any_for_param:
+                break
+
+        log_fn(f"Total unique vehicle pages to scrape: {len(links)}")
+
+        links_sorted = sorted(links)
+        total = len(links_sorted)
+        for i, url in enumerate(links_sorted, 1):
+            resp = get(url, session)
+            time.sleep(REQUEST_DELAY)
+            if resp is not None:
+                v = parse_detail_page(resp.text, url, domain, source_url, pattern)
+                vehicles.append(v)
+            progress_fn(i, total)
 
     return platform, vehicles
 
 
 def run_batch_job(job_id: str, urls: list, max_pages: int):
-    q = JOBS[job_id]["queue"]
     url_jobs = JOBS[job_id]["url_jobs"]
     n_urls = len(urls)
 
-    for idx, source_url in enumerate(urls):
-        url_jobs[idx]["status"] = "running"
-        q.put({"type": "url_start", "url_index": idx, "url": source_url,
-               "overall_index": idx + 1, "overall_total": n_urls})
+    try:
+        for idx, source_url in enumerate(urls):
+            url_jobs[idx]["status"] = "running"
+            push_event(job_id, {"type": "url_start", "url_index": idx, "url": source_url,
+                                "overall_index": idx + 1, "overall_total": n_urls})
 
-        def log_fn(msg, is_err=False, _idx=idx):
-            q.put({"type": "log", "url_index": _idx, "message": msg, "is_err": is_err})
+            def log_fn(msg, is_err=False, _idx=idx):
+                push_event(job_id, {"type": "log", "url_index": _idx,
+                                    "message": msg, "is_err": is_err})
 
-        def progress_fn(current, total, _idx=idx):
-            q.put({"type": "progress", "url_index": _idx, "current": current, "total": total})
+            def progress_fn(current, total, _idx=idx):
+                push_event(job_id, {"type": "progress", "url_index": _idx,
+                                    "current": current, "total": total})
 
-        try:
-            platform, vehicles = scrape_one_url(source_url, max_pages, log_fn, progress_fn)
-            url_jobs[idx]["vehicles"] = vehicles
-            url_jobs[idx]["platform"] = platform or "unknown"
-            url_jobs[idx]["status"] = "done" if vehicles else "error"
-            q.put({"type": "url_done", "url_index": idx, "count": len(vehicles),
-                   "platform": platform or "unknown"})
-        except Exception as e:
-            url_jobs[idx]["status"] = "error"
-            q.put({"type": "log", "url_index": idx, "message": f"ERROR: {e}", "is_err": True})
-            q.put({"type": "url_done", "url_index": idx, "count": 0, "platform": "error"})
-
-    total_count = sum(len(uj["vehicles"]) for uj in url_jobs)
-    JOBS[job_id]["status"] = "done"
-    q.put({"type": "done", "total_count": total_count})
+            try:
+                platform, vehicles = scrape_one_url(source_url, max_pages, log_fn, progress_fn)
+                url_jobs[idx]["vehicles"] = vehicles
+                url_jobs[idx]["platform"] = platform or "unknown"
+                url_jobs[idx]["status"] = "done" if vehicles else "error"
+                push_event(job_id, {"type": "url_done", "url_index": idx, "count": len(vehicles),
+                                    "platform": platform or "unknown"})
+            except Exception as e:
+                url_jobs[idx]["status"] = "error"
+                push_event(job_id, {"type": "log", "url_index": idx,
+                                    "message": f"ERROR: {e}", "is_err": True})
+                push_event(job_id, {"type": "url_done", "url_index": idx,
+                                    "count": 0, "platform": "error"})
+    finally:
+        # Always mark the job finished, even on an unexpected crash, so no
+        # stream is left waiting forever.
+        total_count = sum(len(uj["vehicles"]) for uj in url_jobs)
+        JOBS[job_id]["status"] = "done"
+        JOBS[job_id]["finished"] = time.time()
+        push_event(job_id, {"type": "done", "total_count": total_count})
 
 
 # --------------------------------------------------------------------------
@@ -586,7 +652,9 @@ INVENTORY_BUTTON_SNIPPET = """
     note.textContent = "Scraping running...";
 
     poller = setInterval(function () {
-      fetch("/api/inventory/" + id)
+      // ?summary=1 -> server returns only status + count while running,
+      // not the full vehicle list, so polling stays cheap.
+      fetch("/api/inventory/" + id + "?summary=1")
         .then(function (r) { return r.json(); })
         .then(function (d) {
           if (d.status === "done") {
@@ -649,6 +717,8 @@ def index():
 
 @app.route("/api/scrape", methods=["POST"])
 def api_scrape():
+    cleanup_old_jobs()
+
     data = request.get_json(force=True)
     raw_urls = data.get("urls", [])
     max_pages = int(data.get("max_pages", DEFAULT_MAX_PAGES))
@@ -665,15 +735,19 @@ def api_scrape():
         return jsonify({"error": "No valid URLs provided."}), 400
 
     job_id = str(uuid.uuid4())
-    JOBS[job_id] = {
-        "queue": queue.Queue(),
-        "status": "running",
-        "url_jobs": [
-            {"url": u, "domain": urlparse(u).netloc, "status": "pending",
-             "platform": None, "vehicles": []}
-            for u in clean_urls
-        ],
-    }
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "events": [],
+            "cond": threading.Condition(),
+            "status": "running",
+            "created": time.time(),
+            "finished": None,
+            "url_jobs": [
+                {"url": u, "domain": urlparse(u).netloc, "status": "pending",
+                 "platform": None, "vehicles": []}
+                for u in clean_urls
+            ],
+        }
     t = threading.Thread(target=run_batch_job, args=(job_id, clean_urls, max_pages), daemon=True)
     t.start()
     return jsonify({"job_id": job_id, "urls": clean_urls})
@@ -685,14 +759,34 @@ def api_stream(job_id):
         return "Unknown job", 404
 
     def generate():
-        q = JOBS[job_id]["queue"]
+        # Every stream keeps its OWN read position in the job's event list,
+        # so several tabs / reconnects never steal each other's messages.
+        pos = 0
         while True:
-            item = q.get()
-            yield f"data: {json.dumps(item)}\n\n"
-            if item.get("type") == "done":
-                break
+            job = JOBS.get(job_id)
+            if job is None:
+                return  # job was cleaned up
+            with job["cond"]:
+                if pos >= len(job["events"]):
+                    job["cond"].wait(timeout=STREAM_PING_SECONDS)
+                new_items = job["events"][pos:]
+                pos += len(new_items)
 
-    return Response(generate(), mimetype="text/event-stream")
+            if not new_items:
+                # Keep-alive comment: stops proxies from closing an idle
+                # connection, and lets the server notice a closed browser tab.
+                yield ": ping\n\n"
+                continue
+
+            for item in new_items:
+                yield f"data: {json.dumps(item)}\n\n"
+                if item.get("type") == "done":
+                    return
+
+    resp = Response(generate(), mimetype="text/event-stream")
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["X-Accel-Buffering"] = "no"  # disable proxy buffering
+    return resp
 
 
 @app.route("/api/results/<job_id>")
@@ -727,10 +821,17 @@ def api_inventory(job_id):
     Same vehicles as /api/results, but duplicates are collapsed on VIN
     (falling back to the detail-page URL when a VIN is missing) so re-scraping
     the same dealer updates rows instead of piling up copies.
+
+    With ?summary=1 only status + count are returned (used by the page's
+    3-second poller so it doesn't rebuild the whole list every time).
     """
     job = JOBS.get(job_id)
     if not job:
         return jsonify({"error": "Unknown job"}), 404
+
+    if request.args.get("summary") == "1":
+        count = sum(len(uj["vehicles"]) for uj in job["url_jobs"])
+        return jsonify({"job_id": job_id, "status": job["status"], "count": count})
 
     deduped = {}
     for uj in job["url_jobs"]:
@@ -869,4 +970,5 @@ if __name__ == "__main__":
     # Render supplies PORT; locally it falls back to 5000.
     port = int(os.environ.get("PORT", 5000))
     debug = os.environ.get("FLASK_DEBUG", "1") == "1"
-    app.run(debug=debug, host="0.0.0.0", port=port)
+    # threaded=True so the local dev server also handles several users at once
+    app.run(debug=debug, host="0.0.0.0", port=port, threaded=True)
