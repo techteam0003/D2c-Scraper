@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Dealer Inventory Scraper</title>
+<title>v3 - Dealer Inventory Scraper</title>
 <style>
   :root {
     --bg: #0f172a;
@@ -170,10 +170,11 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>Dealer Inventory Scraper <span class="badge">multi-platform</span></h1>
+  <h1>Dealer Inventory Scraper <span class="badge">v3 &middot; used-inventory fix</span></h1>
   <div class="subtitle">Paste one or more listing-page URLs (one per line). Each site's detail-page URL pattern
-    is auto-detected (SM360 classic "/used/...-idN.html", SM360 "/used-inventory/make/model/...-idN",
-    numeric-path platforms like garagetardif.com, or a generic "-idN" fallback). Results combine into one CSV or Excel file.</div>
+    is auto-detected. SM360 / 360.Agency sites (JavaScript-rendered listings) are read via the dealer's own sitemap, so
+    one listing URL gets the whole inventory — no need to paste ?page=2, 3, 4… Also supports numeric-path platforms like
+    garagetardif.com. Results combine into one CSV or Excel file.</div>
 
   <div class="panel">
     <label class="small">Listing page URLs (one per line)</label>
@@ -211,9 +212,9 @@ https://www.hamelhonda.com/en/used-inventory/honda"></textarea>
       <table id="resultsTable">
         <thead>
           <tr>
-            <th>Source</th><th>Platform</th><th>Title</th><th>Year</th><th>Make</th><th>Model</th><th>Trim</th>
+            <th>Source</th><th>Platform</th><th>Cond.</th><th>Cert.</th><th>Title</th><th>Year</th><th>Make</th><th>Model</th><th>Trim</th>
             <th>Price</th><th>Mileage</th><th>VIN</th><th>Stock #</th>
-            <th>Transmission</th><th>Ext. Colour</th><th>Link</th>
+            <th>Transmission</th><th>Drivetrain</th><th>Fuel</th><th>Ext. Colour</th><th>Link</th>
           </tr>
         </thead>
         <tbody id="resultsBody"></tbody>
@@ -330,10 +331,15 @@ async function startScrape() {
       if (label) label.textContent = `${item.current} / ${item.total} vehicles scraped`;
 
     } else if (item.type === 'url_done') {
-      setStatus(item.url_index, item.count > 0 ? 'done' : 'error');
-      if (item.platform) setPlatform(item.url_index, item.platform);
       const label = document.getElementById('label-' + item.url_index);
-      if (label) label.textContent = `Done — ${item.count} vehicles found`;
+      if (item.platform) setPlatform(item.url_index, item.platform);
+      if (item.skipped) {
+        setStatus(item.url_index, 'done');
+        if (label) label.textContent = `Skipped — same listing as URL ${item.duplicate_of} (already fully scraped)`;
+      } else {
+        setStatus(item.url_index, item.count > 0 ? 'done' : 'error');
+        if (label) label.textContent = `Done — ${item.count} vehicles found`;
+      }
 
     } else if (item.type === 'done') {
       evtSource.close();
@@ -373,6 +379,8 @@ async function loadResults(jobId) {
     tr.innerHTML = `
       <td>${escapeHtml(v.domain)}</td>
       <td>${escapeHtml(platformBySource[v.source_url] || '')}</td>
+      <td>${escapeHtml(v.condition)}</td>
+      <td>${escapeHtml(v.certified)}</td>
       <td>${escapeHtml(v.title)}</td>
       <td>${escapeHtml(v.year)}</td>
       <td>${escapeHtml(v.make)}</td>
@@ -383,6 +391,8 @@ async function loadResults(jobId) {
       <td>${escapeHtml(v.vin)}</td>
       <td>${escapeHtml(v.stock_number || v.stock_id)}</td>
       <td>${escapeHtml(v.transmission)}</td>
+      <td>${escapeHtml(v.drivetrain)}</td>
+      <td>${escapeHtml(v.fuel_type)}</td>
       <td>${escapeHtml(v.exterior_color)}</td>
       <td><a class="veh-link" href="${v.url}" target="_blank">view</a></td>
     `;

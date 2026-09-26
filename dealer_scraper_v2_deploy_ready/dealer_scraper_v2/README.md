@@ -1,4 +1,45 @@
-# Multi-Platform Dealer Inventory Scraper — local web app
+# Multi-Platform Dealer Inventory Scraper — local web app (v3)
+
+## v3: what was broken, and the fix (valleyfieldhonda.com)
+
+**Platform:** Valleyfield Honda runs on **SM360 / 360.Agency** (footer: "Powered and
+developed by 360.Agency", all assets on `img.sm360.ca`, "My Transaction" bar).
+
+**Symptoms in v2:** every `?page=N` URL returned the same 15 "vehicles" — all new
+2025–2026 Hondas with VIN `00000000000000000`, mileage `1`, and stock #s like 29471.
+
+**Root cause:**
+1. SM360's listing page builds its vehicle cards with JavaScript. `requests` gets an
+   empty shell (0 cars), and `?page=2..5` return the identical shell.
+2. With no real cars in the HTML, the `generic-id-suffix` fallback matched the
+   **footer "Honda Vehicles" links** (`/en/new-catalog/honda/2026-honda-accord-se-id33538`).
+   Those are model-lineup brochure pages, not inventory — hence the placeholder VIN,
+   mileage 1, and "stock #" = catalog id.
+3. The VIN regex rejected the `VIN #1C4…` format, so the placeholder was never replaced.
+4. Detail-page regexes also read the "Similar Vehicles" carousel (other cars' data).
+
+**Fix:**
+- SM360 is detected automatically, and the complete inventory is read from the
+  dealer's own HTML sitemap (`/en/sitemap` or `/fr/plan-du-site`), which lists every
+  in-stock vehicle with its real URL. It is then scoped to what your listing URL asked
+  for: used vs new, `/used-inventory/{make}[/{model}]`, `certified-inventory`
+  (certified only), `hybrid-electric-used-inventory` (hybrid/EV only).
+- Catalog / news / special-offer / form links are never treated as vehicles.
+- Detail pages are parsed from the server-rendered **Specifications** block:
+  Stock #, VIN, Fuel, Ext./Int. colour, Drivetrain, Trim, Transmission, Mileage,
+  Bodystyle, Doors, Passengers, Cylinders, Engine — plus the selling price and the
+  original (pre-reduction) price. Works on EN and FR pages.
+- Placeholder VINs rejected; "Similar Vehicles" section ignored.
+- Paste just ONE listing URL. If you paste `?page=1…5`, the duplicates are skipped,
+  and vehicles are de-duplicated across the whole batch.
+
+New CSV/Excel columns: `condition`, `certified`, `original_price`, `cylinders`,
+`doors`, `passengers`. `price` and `mileage` are now plain numbers.
+
+Run on a different port: `PORT=5002 python app.py` (Windows: `set PORT=5002` first).
+
+---
+
 
 A Flask app with a browser frontend: paste one or more dealer listing-page
 URLs, watch it scrape live (progress bar + log, with the detected platform
@@ -79,9 +120,10 @@ Then open **http://localhost:5000**.
 ## Output columns (CSV and Excel)
 
 ```
-source_url, domain, url, stock_id, title, year, make, model, trim, price,
-mileage, vin, stock_number, exterior_color, interior_color, transmission,
-engine, fuel_type, drivetrain, body_type, image_url, extraction_notes
+source_url, domain, url, stock_id, condition, certified, title, year, make,
+model, trim, price, original_price, mileage, vin, stock_number,
+exterior_color, interior_color, transmission, engine, cylinders, fuel_type,
+drivetrain, body_type, doors, passengers, image_url, extraction_notes
 ```
 
 `extraction_notes` says whether a row came from JSON-LD, a regex fallback,

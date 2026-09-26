@@ -1,122 +1,63 @@
 #!/usr/bin/env python3
 """
-Multi-Platform Dealer Inventory Scraper - local web app.
+Multi-Platform Dealer Inventory Scraper - local web app (v3).
 
 Run:
     pip install -r requirements.txt
-    python app.py
-Then open:
-    http://localhost:5000
+    python app.py            (or:  PORT=5002 python app.py)
+Then open http://localhost:5000
 
-Paste one or more dealer LISTING-page URLs (one per line), watch live
-progress, then browse combined results and download CSV or Excel.
+WHAT WAS WRONG IN v2 (found on valleyfieldhonda.com, an SM360 / 360.Agency site)
+--------------------------------------------------------------------------------
+1. SM360 listing pages build their vehicle cards with JavaScript. A plain
+   `requests.get()` sees ZERO cars, and ?page=2..N return the identical shell.
+2. With no real cars in the HTML, the "generic-id-suffix" fallback matched the
+   footer's "Honda Vehicles" links (/en/new-catalog/honda/...-id33538). Those
+   are model-brochure pages, so the output was 15 NEW 2025-2026 Hondas with
+   VIN 00000000000000000 and mileage 1 -- and the same 15 on every page URL.
+3. The VIN regex didn't allow "VIN #1C4...", so the placeholder JSON-LD VIN
+   was never overridden.
+4. Detail-page regexes ran over the whole page, including the "Similar
+   Vehicles" carousel, which holds other cars' prices/VINs/stock numbers.
 
-WHY THIS VERSION EXISTS
-------------------------
-The original tool was built around one specific SM360 URL shape:
-    /used/{slug}-id{stock_id}.html
-That pattern is used by some SM360 dealer sites, but NOT all of them.
-Inspecting a second dealership (Hamel Chevrolet Buick GMC, also SM360 --
-confirmed by its <img src="https://img.sm360.ca/..."> assets and by the
-schema.org/Car JSON-LD blocks on its vehicle pages) showed a DIFFERENT
-detail-page URL shape:
-    /en/used-inventory/{make}/{model}/{year}-{make}-{model}-id{stock_id}
-(no ".html", and the path prefix is "used-inventory" not "used").
-Its listing pages also paginate with ?page=N (seen alongside
-namedSorting=default&limit=12 in the query string), rather than the
-generic page/pageNumber/p guesswork used before.
-
-A third dealer platform (seen in a sample CSV of garagetardif.com, a
-WordPress-based site, NOT SM360) uses yet another shape:
-    /en/pre-owned/{year}/{make}/{model}/{numeric_id}
-
-Rather than hard-coding one shape, this version tries several known
-detail-URL patterns against each listing page and uses whichever one
-actually finds vehicle links -- logging which "platform" it detected.
-New patterns can be added to DETAIL_URL_PATTERNS without touching the
-rest of the pipeline.
-
-CONCURRENCY NOTES (multiple users at the same time)
----------------------------------------------------
-* JOBS lives in memory, so gunicorn must run with ONE worker process
-  (--workers 1) and many threads. With 2+ workers, /api/stream or
-  /api/results can land on a process that never saw the job -> 404.
-* Each job keeps a list of events instead of a single Queue, so any
-  number of browser streams (including EventSource auto-reconnects) can
-  read the same job without stealing each other's messages, and no
-  stream thread can get stuck forever waiting on an empty queue.
-* Streams send a keep-alive ping every 15s and stop as soon as the job
-  is finished or removed, so server threads are always freed.
-* HTML is parsed with lxml (much faster than html.parser), so one
-  user's scrape no longer eats all the CPU on a small server.
-* Old finished jobs are cleaned up so memory does not grow forever.
+FIXES
+-----
+* SM360 sites are detected (img.sm360.ca / 360.agency) and the full inventory
+  is read from the site's own HTML sitemap (/en/sitemap or /fr/plan-du-site),
+  which lists every in-stock vehicle. It is then filtered to what the listing
+  URL asked for: used vs new, make/model sub-paths, certified-only,
+  hybrid/EV-only.
+* Catalog / news / offers / form links are never treated as vehicles.
+* Detail pages are parsed from SM360's server-rendered "Specifications" block
+  (Stock #, VIN #, Fuel, colours, Drivetrain, Trim, Transmission, Mileage,
+  Bodystyle, Doors, Passengers, Cylinders, Engine), with selling price AND
+  original (pre-reduction) price. JSON-LD and regex are fallbacks only.
+* Placeholder VINs are rejected; "Similar Vehicles" is excluded.
+* Pasting the same listing as ?page=1..5 scrapes it once; vehicles are
+  de-duplicated across the whole batch.
 """
 
 import csv
 import io
 import json
 import os
+import queue
 import re
 import threading
 import time
 import uuid
 from dataclasses import dataclass, asdict, fields
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urldefrag
 
 import requests
-from bs4 import BeautifulSoup, SoupStrainer
+from bs4 import BeautifulSoup
 from flask import Flask, Response, jsonify, render_template, request, send_file
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font
 
-# lxml is a C parser, many times faster than Python's html.parser. Falls back
-# automatically if it isn't installed.
-try:
-    import lxml  # noqa: F401
-    HTML_PARSER = "lxml"
-except ImportError:
-    HTML_PARSER = "html.parser"
-
 app = Flask(__name__)
-
-# --------------------------------------------------------------------------
-# INVENTORY DASHBOARD INTEGRATION
-# --------------------------------------------------------------------------
-# The DreamTech Master Scraper dashboard is a frontend-only app, so it cannot
-# receive a push from this server. Instead this scraper keeps each finished
-# job in memory (JOBS, already used for CSV/Excel downloads) and exposes it at
-#     GET /api/inventory/<job_id>
-# The "Send to Inventory" button opens the dashboard with ?import=<job_id>,
-# and the dashboard pulls the data from that endpoint.
-#
-# Override the dashboard address without editing code by setting the
-# DASHBOARD_URL environment variable (on Render: Settings -> Environment).
-# --------------------------------------------------------------------------
-DASHBOARD_URL = os.environ.get(
-    "DASHBOARD_URL", "https://dreamtech-master-scraper.ai.studio"
-).rstrip("/")
-
-# Browsers block cross-site fetches unless the server says otherwise. These are
-# the origins allowed to read /api/* responses.
-ALLOWED_ORIGINS = {
-    DASHBOARD_URL,
-    "http://localhost:3000",
-    "http://localhost:5173",
-}
-
-
-@app.after_request
-def _allow_dashboard_cors(resp):
-    if request.path.startswith("/api/"):
-        origin = request.headers.get("Origin", "")
-        if origin in ALLOWED_ORIGINS:
-            resp.headers["Access-Control-Allow-Origin"] = origin
-            resp.headers["Vary"] = "Origin"
-            resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
-            resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    return resp
-
+VERSION = "v3.2 (SM360 used-inventory fix + retries)"
 
 HEADERS = {
     "User-Agent": (
@@ -126,89 +67,54 @@ HEADERS = {
     "Accept-Language": "en-CA,en;q=0.9,fr-CA;q=0.8,fr;q=0.7",
 }
 REQUEST_DELAY = 1.2
-REQUEST_TIMEOUT = 15
+REQUEST_TIMEOUT = 20
 DEFAULT_MAX_PAGES = 40
 
-# How long a finished job stays in memory (for downloads / dashboard import).
-JOB_TTL_SECONDS = int(os.environ.get("JOB_TTL_SECONDS", 3 * 60 * 60))
-# How often an open stream sends a keep-alive ping while waiting.
-STREAM_PING_SECONDS = 15
-
 # --------------------------------------------------------------------------
-# Platform detection: each entry is (platform_name, compiled_regex).
-# The regex must have its first capturing group be the numeric stock/listing
-# id. Tried in order against a listing page's HTML; the first pattern that
-# matches at least one href wins for that source URL (and every subsequent
-# paginated page from that same source URL reuses the same pattern).
+# Detail-page URL patterns. First capture group = numeric listing id.
 # --------------------------------------------------------------------------
 DETAIL_URL_PATTERNS = [
     ("sm360-html",
      re.compile(r"/used/[^\"'>\s]+-id(\d+)\.html", re.IGNORECASE)),
 
     ("sm360-inventory-path",
-     # e.g. /en/used-inventory/ford/maverick/2023-ford-maverick-id35313906
-     # also matches /en/new-inventory/... on the same platform
-     re.compile(r"/(?:used|new|all)-inventory/[a-z0-9\-]+/[a-z0-9\-]+/"
+     # /en/used-inventory/jeep/wrangler-4xe/2022-jeep-wrangler-4xe-id38899854
+     # /fr/inventaire-occasion/jeep/wrangler-4xe/jeep-wrangler-4xe-2022-id38899854
+     re.compile(r"/(?:used|new|all|certified)-inventory/[a-z0-9\-]+/[a-z0-9\-]+/"
+                r"[a-z0-9\-]*-id(\d+)(?=[/?#\"'>\s]|$)"
+                r"|/inventaire-(?:occasion|neuf)/[a-z0-9\-]+/[a-z0-9\-]+/"
                 r"[a-z0-9\-]*-id(\d+)(?=[/?#\"'>\s]|$)", re.IGNORECASE)),
 
     ("syncauto-numeric-path",
-     # e.g. /en/pre-owned/2004/nissan/350z/2745
      re.compile(r"/(?:pre-owned|used|inventory)/(?:19|20)\d{2}/"
                 r"[a-z0-9\-]+/[a-z0-9\-]+/(\d{3,9})(?=[/?#\"'>\s]|$)",
                 re.IGNORECASE)),
 
     ("generic-id-suffix",
-     # catch-all: any href ending in "...-id123456" regardless of path,
-     # optionally followed by .html
      re.compile(r"-id(\d{4,10})(?:\.html)?(?=[/?#\"'>\s]|$)", re.IGNORECASE)),
 ]
 
-# Params various listing pages use for pagination, tried in order.
+# BUG FIX #1: URLs that end in "-idNNNN" but are NOT vehicles for sale.
+# On SM360 sites the footer of EVERY page has a "Honda Vehicles" block linking
+# to /en/new-catalog/honda/2026-honda-accord-se-id33538 etc. (model-lineup
+# brochure pages with a placeholder VIN 00000000000000000 and mileage 1).
+# The old generic-id-suffix fallback happily scraped those as "inventory".
+NON_VEHICLE_PATH_RE = re.compile(
+    r"/(?:new-catalog|catalogue-neuf|catalog|catalogue|special-offers|"
+    r"offres-speciales|promotions|news|nouvelles|form|formulaire|showroom|"
+    r"services|blog|careers|carrieres)(?:/|$)", re.IGNORECASE)
+
 PAGE_PARAM_CANDIDATES = ["page", "pageNumber", "p"]
 
 CSV_FIELDNAMES = [
-    "source_url", "domain", "url", "stock_id", "title", "year", "make",
-    "model", "trim", "price", "mileage", "vin", "stock_number",
-    "exterior_color", "interior_color", "transmission", "engine",
-    "fuel_type", "drivetrain", "body_type", "image_url", "extraction_notes",
+    "source_url", "domain", "url", "stock_id", "condition", "certified",
+    "title", "year", "make", "model", "trim", "price",
+    "mileage", "vin", "stock_number", "exterior_color", "interior_color",
+    "transmission", "engine", "cylinders", "fuel_type", "drivetrain",
+    "body_type", "doors", "passengers", "image_url", "extraction_notes",
 ]
 
-# job_id -> {
-#   "events": [ {...}, ... ],        # every message ever sent for this job
-#   "cond": threading.Condition(),    # wakes up streams when events arrive
-#   "status": "running|done|error",
-#   "created": float, "finished": float|None,
-#   "url_jobs": [ {"url":..., "domain":..., "status":..., "platform":...,
-#                  "vehicles":[...]} , ... ],
-# }
 JOBS = {}
-JOBS_LOCK = threading.Lock()
-
-
-def push_event(job_id: str, item: dict):
-    """Append an event to a job and wake every stream watching it."""
-    job = JOBS.get(job_id)
-    if not job:
-        return
-    with job["cond"]:
-        job["events"].append(item)
-        job["cond"].notify_all()
-
-
-def cleanup_old_jobs():
-    """Drop finished jobs older than JOB_TTL_SECONDS so memory stays flat."""
-    now = time.time()
-    with JOBS_LOCK:
-        stale = [
-            jid for jid, j in JOBS.items()
-            if j.get("finished") and now - j["finished"] > JOB_TTL_SECONDS
-        ]
-        for jid in stale:
-            job = JOBS.pop(jid, None)
-            if job:
-                # wake any stream still attached so it can exit
-                with job["cond"]:
-                    job["cond"].notify_all()
 
 
 @dataclass
@@ -217,12 +123,15 @@ class Vehicle:
     domain: str = ""
     url: str = ""
     stock_id: str = ""
+    condition: str = ""
+    certified: str = ""
     title: str = ""
     year: str = ""
     make: str = ""
     model: str = ""
     trim: str = ""
     price: str = ""
+    original_price: str = ""
     mileage: str = ""
     vin: str = ""
     stock_number: str = ""
@@ -230,13 +139,19 @@ class Vehicle:
     interior_color: str = ""
     transmission: str = ""
     engine: str = ""
+    cylinders: str = ""
     fuel_type: str = ""
     drivetrain: str = ""
     body_type: str = ""
+    doors: str = ""
+    passengers: str = ""
     image_url: str = ""
     extraction_notes: str = ""
 
 
+# ==========================================================================
+# helpers
+# ==========================================================================
 def normalize_url(raw: str) -> str:
     raw = raw.strip()
     if not raw:
@@ -246,69 +161,203 @@ def normalize_url(raw: str) -> str:
     return raw
 
 
-def get(url: str, session=None):
-    try:
-        requester = session or requests
-        resp = requester.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 200:
-            return resp
-        return None
-    except requests.RequestException:
-        return None
+_session = requests.Session()
+_session.headers.update(HEADERS)
+_session.headers.update({
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate",
+    "Cache-Control": "no-cache",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+})
+_last_error = {}
 
 
-def _all_hrefs(html: str):
-    """Parse ONLY <a> tags -- much cheaper than building the whole tree."""
-    soup = BeautifulSoup(html, HTML_PARSER, parse_only=SoupStrainer("a"))
-    return [a["href"] for a in soup.find_all("a", href=True)]
+def last_error() -> str:
+    return _last_error.get(threading.get_ident(), "")
 
 
-def detect_platform_and_links(html: str, base_url: str):
-    """Try each known detail-URL pattern in order. Returns
-    (platform_name, regex, set_of_absolute_urls) for the first pattern
-    that finds at least one match, or (None, None, set()) if none do."""
-    hrefs = _all_hrefs(html)
-    for name, pattern in DETAIL_URL_PATTERNS:
-        links = {urljoin(base_url, h) for h in hrefs if pattern.search(h)}
-        if links:
-            return name, pattern, links
-    return None, None, set()
+def get(url: str, retries: int = 3):
+    """GET with retries + backoff. On failure returns None and records WHY
+    (HTTP status or network error) so the log can show it."""
+    err = ""
+    for attempt in range(1, retries + 1):
+        try:
+            resp = _session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            if resp.status_code == 200:
+                _last_error.pop(threading.get_ident(), None)
+                return resp
+            err = f"HTTP {resp.status_code}"
+            if resp.status_code in (403, 429, 503):
+                err += " (the site is blocking/rate-limiting requests - wait 10-15 min)"
+            if resp.status_code == 404:
+                break
+        except requests.RequestException as e:
+            err = f"{type(e).__name__}: {str(e)[:150]}"
+        if attempt < retries:
+            time.sleep(3 * attempt)
+    _last_error[threading.get_ident()] = err
+    return None
 
 
-def find_detail_links_with_pattern(html: str, base_url: str, pattern) -> set:
-    return {urljoin(base_url, h) for h in _all_hrefs(html) if pattern.search(h)}
+def _pattern_id(pattern, s: str) -> str:
+    m = pattern.search(s) if pattern is not None else None
+    if not m:
+        return ""
+    return next((g for g in m.groups() if g), "")
 
 
 def stock_id_from_url(url: str, pattern) -> str:
-    if pattern is None:
-        return ""
-    m = pattern.search(url)
-    return m.group(1) if m else ""
+    sid = _pattern_id(pattern, url)
+    if not sid:
+        m = re.search(r"-id(\d{4,10})", url)
+        sid = m.group(1) if m else ""
+    return sid
 
 
-# Words that commonly start the NEXT labelled field on a dealer page. Used
-# as a stop boundary so we don't swallow the next label's value into the
-# current one.
+def clean_link(href: str, base_url: str) -> str:
+    return urldefrag(urljoin(base_url, href))[0]
+
+
+def is_vehicle_link(url: str, pattern) -> bool:
+    if NON_VEHICLE_PATH_RE.search(urlparse(url).path):
+        return False
+    return bool(pattern.search(url))
+
+
+def is_sm360(html: str) -> bool:
+    h = html[:400000].lower()
+    return "img.sm360.ca" in h or "360.agency" in h or "sm360" in h
+
+
+def listing_key(url: str) -> str:
+    """Listing URL with pagination params removed, used to spot the same
+    listing pasted several times as ?page=1, ?page=2, ..."""
+    p = urlparse(url)
+    q = {k: v for k, v in parse_qs(p.query).items()
+         if k not in PAGE_PARAM_CANDIDATES}
+    qs = urlencode(sorted(q.items()), doseq=True)
+    return f"{p.netloc.lower()}{p.path.rstrip('/').lower()}?{qs}"
+
+
+def _all_links(html: str, base_url: str):
+    soup = BeautifulSoup(html, "html.parser")
+    return [clean_link(a["href"], base_url) for a in soup.find_all("a", href=True)]
+
+
+def detect_platform_and_links(html: str, base_url: str):
+    """Pick the detail-URL pattern that matches the MOST links on the page
+    (ignoring catalog/news/offer links). Returns (name, regex, set)."""
+    hrefs = _all_links(html, base_url)
+    best = (None, None, set())
+    for name, pattern in DETAIL_URL_PATTERNS:
+        links = {h for h in hrefs if is_vehicle_link(h, pattern)}
+        if len(links) > len(best[2]):
+            best = (name, pattern, links)
+    return best
+
+
+def find_detail_links_with_pattern(html: str, base_url: str, pattern) -> set:
+    return {h for h in _all_links(html, base_url) if is_vehicle_link(h, pattern)}
+
+
+# ---------- listing scope: what did the user actually ask for? ----------
+USED_MARKERS = ("used", "occasion", "pre-owned", "preowned", "certified",
+                "certifi", "usag", "d-occasion")
+NEW_MARKERS = ("new-inventory", "inventaire-neuf", "/new/", "/neuf/",
+               "hybrid-electric-inventory", "electric-inventory")
+
+
+def condition_of_url(url: str) -> str:
+    path = urlparse(url).path.lower() + "/"
+    if any(m in path for m in USED_MARKERS):
+        return "used"
+    if any(m in path for m in NEW_MARKERS):
+        return "new"
+    return ""
+
+
+def listing_scope(source_url: str) -> dict:
+    """Derive filters from an SM360-style listing URL, e.g.
+       /en/used-inventory                -> condition=used
+       /en/used-inventory/honda          -> + make=honda
+       /en/certified-inventory           -> + certified only
+       /en/hybrid-electric-used-inventory-> + hybrid/electric only"""
+    path = urlparse(source_url).path.lower().strip("/")
+    segs = [s for s in path.split("/") if s]
+    scope = {"condition": condition_of_url(source_url), "make": "",
+             "model": "", "certified": False, "electrified": False}
+    for i, s in enumerate(segs):
+        if s.endswith("inventory") or s.startswith("inventaire"):
+            if "certif" in s:
+                scope["certified"] = True
+            if "hybrid" in s or "electri" in s:
+                scope["electrified"] = True
+            rest = segs[i + 1:]
+            if rest:
+                scope["make"] = rest[0]
+            if len(rest) > 1 and not re.search(r"-id\d+$", rest[1]):
+                scope["model"] = rest[1]
+            break
+    return scope
+
+
+def link_matches_scope(url: str, scope: dict) -> bool:
+    if scope["condition"]:
+        lc = condition_of_url(url)
+        if lc and lc != scope["condition"]:
+            return False
+    if scope["make"] or scope["model"]:
+        segs = [s for s in urlparse(url).path.lower().split("/") if s]
+        for i, s in enumerate(segs):
+            if s.endswith("inventory") or s.startswith("inventaire"):
+                rest = segs[i + 1:]
+                if scope["make"] and (not rest or rest[0] != scope["make"]):
+                    return False
+                if scope["model"] and (len(rest) < 2 or rest[1] != scope["model"]):
+                    return False
+                break
+    return True
+
+
+def vehicle_matches_scope(v, scope: dict) -> bool:
+    if scope["certified"] and v.certified != "yes":
+        return False
+    if scope["electrified"] and not re.search(
+            r"hybrid|hybride|electric|électrique|electrique|phev|plug",
+            f"{v.fuel_type} {v.title}", re.IGNORECASE):
+        return False
+    return True
+
+
+def sm360_sitemap_urls(source_url: str) -> list:
+    p = urlparse(source_url)
+    root = f"{p.scheme}://{p.netloc}"
+    first = (p.path.strip("/").split("/") or [""])[0].lower()
+    en, fr = f"{root}/en/sitemap", f"{root}/fr/plan-du-site"
+    return [fr, en] if first == "fr" else [en, fr]
+
+
+# ==========================================================================
+# detail-page parsing
+# ==========================================================================
 FIELD_STOP_PREFIXES = (
-    "interior", "exterior", "ext", "int", "colo",  # colo(u)r / colo(u)rs
-    "vin", "stock", "transmiss", "engine", "mileage", "odomet", "door",
-    "passenger", "fuel", "drivetrain", "drive", "body", "trim", "price",
-    "km", "cylind", "seat", "gear", "config",
+    "interior", "exterior", "ext", "int", "colo", "vin", "stock", "transmiss",
+    "engine", "mileage", "odomet", "door", "passenger", "fuel", "drivetrain",
+    "drive", "body", "trim", "price", "km", "cylind", "seat", "gear", "config",
 )
 
 
 def regex_field(text: str, *labels: str, max_words: int = 6) -> str:
-    """Grab the value following a label by walking word-by-word until we
-    hit a word that looks like the start of the NEXT label."""
     for label in labels:
         m = re.search(re.escape(label) + r"\s*[:#]?\s*", text, re.IGNORECASE)
         if not m:
             continue
-        words = text[m.end():].split()
         collected = []
-        for w in words[:max_words]:
-            bare = w.strip(".,:#").lower()
-            if bare.startswith(FIELD_STOP_PREFIXES):
+        for w in text[m.end():].split()[:max_words]:
+            if w.strip(".,:#").lower().startswith(FIELD_STOP_PREFIXES):
                 break
             collected.append(w)
         val = " ".join(collected).strip().rstrip(".,:#-")
@@ -318,14 +367,26 @@ def regex_field(text: str, *labels: str, max_words: int = 6) -> str:
 
 
 def regex_token_field(text: str, *labels: str) -> str:
-    """Like regex_field, but for values that should never contain a space
-    (stock numbers, codes) -- stops at the first whitespace no matter what."""
     for label in labels:
-        pattern = re.compile(re.escape(label) + r"\s*[:#]?\s*([A-Za-z0-9\-]{2,20})", re.IGNORECASE)
-        m = pattern.search(text)
+        m = re.search(re.escape(label) + r"\s*[:#]?\s*([A-Za-z0-9\-]{2,20})",
+                      text, re.IGNORECASE)
         if m:
             return m.group(1).strip()
     return ""
+
+
+def valid_vin(vin: str) -> str:
+    """BUG FIX #2: reject placeholder VINs such as 00000000000000000."""
+    vin = (vin or "").strip().upper()
+    if not re.fullmatch(r"[A-HJ-NPR-Z0-9]{11,17}", vin):
+        return ""
+    if len(set(vin)) <= 2:          # 000..., 111..., XXXX...
+        return ""
+    return vin
+
+
+def digits(s: str) -> str:
+    return re.sub(r"[^\d]", "", s or "")
 
 
 def extract_jsonld_vehicle(soup: BeautifulSoup) -> dict:
@@ -339,25 +400,17 @@ def extract_jsonld_vehicle(soup: BeautifulSoup) -> dict:
         for item in candidates:
             if not isinstance(item, dict):
                 continue
-            types = item.get("@type", "")
-            types = types if isinstance(types, list) else [types]
-            if any(t in ("Vehicle", "Car", "Product") for t in types):
-                return item
-            if "@graph" in item:
-                for sub in item["@graph"]:
-                    sub_types = sub.get("@type", "")
-                    sub_types = sub_types if isinstance(sub_types, list) else [sub_types]
-                    if any(t in ("Vehicle", "Car", "Product") for t in sub_types):
-                        return sub
+            pool = [item] + [s for s in item.get("@graph", []) if isinstance(s, dict)]
+            for sub in pool:
+                t = sub.get("@type", "")
+                t = t if isinstance(t, list) else [t]
+                if any(x in ("Vehicle", "Car", "Product") for x in t):
+                    return sub
     return {}
 
 
-# Markers that typically introduce trailing site-name / marketing text in a
-# <title> tag.
-TITLE_CUT_MARKERS = [
-    "|", " – ", " — ", " - Stock", " Stock #", " For Sale",
-    " for sale", " à vendre", " A vendre", " $",
-]
+TITLE_CUT_MARKERS = ["|", " – ", " — ", " - Stock", " Stock #", " For Sale",
+                     " for sale", " à vendre", " A vendre", " $"]
 
 
 def clean_title(title: str) -> str:
@@ -372,8 +425,6 @@ def clean_title(title: str) -> str:
 
 
 def cap_trim(remainder: str, max_chars: int = 25) -> str:
-    """Keep only the first few words of whatever's left after year/make/model
-    so option/feature text doesn't get pulled into the trim field."""
     words = remainder.strip(" -|").split()
     kept, length = [], 0
     for w in words:
@@ -385,164 +436,390 @@ def cap_trim(remainder: str, max_chars: int = 25) -> str:
 
 
 def _na(value):
-    """SM360's JSON-LD frequently uses the literal string "n/a" instead of
-    omitting a field. Treat that the same as missing."""
     if value is None:
         return ""
     s = str(value).strip()
     return "" if s.lower() in ("n/a", "na", "none", "null") else s
 
 
+# ---- SM360 "Specifications" block -------------------------------------
+# Rendered server-side on every SM360 detail page, e.g.
+#   Stock # 2463U VIN # 1C4JJXP68NW108455 Fuel Plug In Hybrid (PHEV)
+#   Ext. Color Green Drivetrain 4x4 Int. color Black Trim Unlimited Sahara
+#   Transmission Automatic Mileage 57841 Bodystyle SUV Doors 4 ...
+SM360_SPEC_LABELS = {
+    "Stock #": "stock_number", "Stock#": "stock_number",
+    "No. d'inventaire": "stock_number", "# d'inventaire": "stock_number",
+    "Inventaire #": "stock_number", "No d'inventaire": "stock_number",
+    "VIN #": "vin", "NIV #": "vin", "VIN": "vin", "NIV": "vin",
+    "Fuel": "fuel_type", "Carburant": "fuel_type",
+    "Ext. Color": "exterior_color", "Ext. Colour": "exterior_color",
+    "Ext. color": "exterior_color", "Couleur ext.": "exterior_color",
+    "Int. color": "interior_color", "Int. Color": "interior_color",
+    "Int. Colour": "interior_color", "Couleur int.": "interior_color",
+    "Drivetrain": "drivetrain", "Rouage": "drivetrain",
+    "Entraînement": "drivetrain",
+    "Trim": "trim", "Version": "trim",
+    "Transmission": "transmission",
+    "Mileage": "mileage", "Kilométrage": "mileage", "Odometer": "mileage",
+    "Bodystyle": "body_type", "Body Style": "body_type",
+    "Carrosserie": "body_type",
+    "Doors": "doors", "Portes": "doors",
+    "Passengers": "passengers", "Passagers": "passengers",
+    "Cylinders": "cylinders", "Cylindres": "cylinders",
+    "Engine": "engine", "Moteur": "engine",
+    # labels we don't keep, but must recognise as boundaries
+    "Frame": None, "Châssis": None, "Previous Use": None,
+    "Previous Owner": None, "Usage antérieur": None,
+    "Propriétaire antérieur": None, "Category": None, "Catégorie": None,
+    "Condition": None, "Warranty": None, "Garantie": None,
+    "Model code": None, "Code de modèle": None,
+}
+_SPEC_RE = re.compile(
+    r"(?<![A-Za-zÀ-ÿ])(" +
+    "|".join(re.escape(k) for k in sorted(SM360_SPEC_LABELS, key=len, reverse=True)) +
+    r")(?![A-Za-zÀ-ÿ])")
+SPEC_START_RE = re.compile(r"\b(Specifications|Spécifications|Caractéristiques)\b")
+SPEC_END_RE = re.compile(r"\b(Options|Read more|Lire la suite|Lire plus|"
+                         r"Similar Vehicles|Véhicules similaires|Equipment|Équipements)\b")
+SIMILAR_RE = re.compile(r"Similar Vehicles|Véhicules similaires|"
+                        r"You may also like|Vous aimerez aussi", re.IGNORECASE)
+
+
+def parse_sm360_specs(main_text: str) -> dict:
+    m = SPEC_START_RE.search(main_text)
+    if not m:
+        return {}
+    block = main_text[m.end():]
+    e = SPEC_END_RE.search(block)
+    if e:
+        block = block[:e.start()]
+    hits = list(_SPEC_RE.finditer(block))
+    out = {}
+    for i, h in enumerate(hits):
+        field = SM360_SPEC_LABELS[h.group(1)]
+        end = hits[i + 1].start() if i + 1 < len(hits) else len(block)
+        val = block[h.end():end].strip(" #:\u00a0-").strip()
+        if field and val and field not in out:
+            out[field] = val
+    return out
+
+
+PRICE_RE = re.compile(
+    r"\$\s?\d{1,3}(?:[,\u00a0\u202f ]\d{3})+(?:\.\d{2})?"      # $35,495
+    r"|\d{1,3}(?:[,\u00a0\u202f ]\d{3})+(?:,\d{2})?\s?\$")      # 35 495 $
+
+
+def sm360_prices(soup: BeautifulSoup, main_text: str):
+    """Returns (selling_price, original_price) as digit strings.
+    SM360 shows 'Purchase Price $36,995 $35,495*' -> the struck-through
+    first number is the original, the last one is what the car sells for."""
+    price, original = "", ""
+    m = re.search(r"(Purchase Price|Selling Price|Sale Price|Prix d'achat|"
+                  r"Prix de vente|Prix)\b(.{0,160})", main_text)
+    if m:
+        chunk = re.split(r"\*|\(GST|\(TPS|\+ ?\(|taxes", m.group(2))[0]
+        found = [digits(x) for x in PRICE_RE.findall(chunk)]
+        found = [f for f in found if len(f) >= 3]
+        if found:
+            price = found[-1]
+            if len(found) > 1 and found[0] != found[-1]:
+                original = found[0]
+    if not price:
+        for key in ("twitter:data1",):
+            tag = soup.find("meta", attrs={"name": key}) or soup.find("meta", attrs={"property": key})
+            if tag and PRICE_RE.search(tag.get("content", "")):
+                price = digits(PRICE_RE.search(tag["content"]).group(0))
+    if not price:
+        og = soup.find("meta", property="og:description")
+        if og and PRICE_RE.search(og.get("content", "")):
+            price = digits(PRICE_RE.search(og["content"]).group(0))
+    return price, original
+
+
+def year_make_model(og_title: str, url: str, pattern):
+    """'2022 Jeep Wrangler 4xe' + URL /used-inventory/jeep/wrangler-4xe/...
+    -> ('2022', 'Jeep', 'Wrangler 4xe'). Uses the URL's make slug to know how
+    many words the make has (Land Rover, Mercedes-Benz, Alfa Romeo...)."""
+    segs = [s for s in urlparse(url).path.split("/") if s]
+    make_slug = model_slug = ""
+    for i, s in enumerate(segs):
+        if s.lower().endswith("inventory") or s.lower().startswith("inventaire"):
+            if len(segs) > i + 2:
+                make_slug, model_slug = segs[i + 1], segs[i + 2]
+            break
+    year = make = model = ""
+    toks = (og_title or "").split()
+    ym = next((t for t in toks if re.fullmatch(r"(19|20)\d{2}", t)), "")
+    if ym:
+        year = ym
+        toks.remove(ym)
+    if make_slug and toks:
+        n = len(make_slug.split("-"))
+        # Mercedes-Benz is one token in the title but two in the slug
+        if "-" in toks[0] and toks[0].lower() == make_slug.lower():
+            n = 1
+        make = " ".join(toks[:n])
+        model = " ".join(toks[n:])
+    if not make and make_slug:
+        make = make_slug.replace("-", " ").title()
+    if not model and model_slug:
+        model = model_slug.replace("-", " ").title()
+    if not year:
+        m = re.search(r"-((?:19|20)\d{2})-|/((?:19|20)\d{2})-", url)
+        year = (m.group(1) or m.group(2)) if m else ""
+    return year, make, model
+
+
 def parse_detail_page(html: str, url: str, domain: str, source_url: str,
-                       detail_pattern) -> Vehicle:
-    soup = BeautifulSoup(html, HTML_PARSER)
+                      detail_pattern) -> Vehicle:
+    soup = BeautifulSoup(html, "html.parser")
     v = Vehicle(source_url=source_url, domain=domain, url=url)
     v.stock_id = stock_id_from_url(url, detail_pattern)
-    text = soup.get_text(" ", strip=True)
+    v.condition = condition_of_url(url)
+    notes = []
 
+    full_text = soup.get_text(" ", strip=True)
+    # BUG FIX #3: ignore the "Similar Vehicles" carousel at the bottom of the
+    # page -- it contains OTHER cars' VINs, stock #s and prices.
+    sim = SIMILAR_RE.search(full_text)
+    main_text = full_text[:sim.start()] if sim else full_text
+    h1 = soup.find("h1")
+    if h1:
+        h1_txt = h1.get_text(" ", strip=True)
+        idx = main_text.find(h1_txt)
+        if idx > 0:
+            main_text_from_h1 = main_text[idx:]
+        else:
+            main_text_from_h1 = main_text
+    else:
+        main_text_from_h1 = main_text
+
+    # ---- 1. SM360 specifications block (visible, most reliable) ----------
+    specs = parse_sm360_specs(main_text_from_h1)
+    if specs:
+        for k, val in specs.items():
+            setattr(v, k, val)
+        notes.append("sm360-specs")
+
+    # ---- 2. JSON-LD fills anything still blank ---------------------------
     ld = extract_jsonld_vehicle(soup)
     if ld:
-        v.title = _na(ld.get("name", ""))
+        def fill(attr, val):
+            val = _na(val)
+            if val and not getattr(v, attr):
+                setattr(v, attr, val)
+        fill("title", ld.get("name"))
         offers = ld.get("offers")
+        if isinstance(offers, list) and offers:
+            offers = offers[0]
         if isinstance(offers, dict):
-            v.price = _na(offers.get("price", ""))
+            fill("price", digits(str(offers.get("price", ""))))
         mfo = ld.get("mileageFromOdometer")
-        v.mileage = _na(mfo.get("value")) if isinstance(mfo, dict) else _na(mfo)
+        fill("mileage", mfo.get("value") if isinstance(mfo, dict) else mfo)
         brand = ld.get("brand")
-        v.make = _na(brand.get("name") if isinstance(brand, dict) else brand)
+        fill("make", brand.get("name") if isinstance(brand, dict) else brand)
         model = ld.get("model")
-        v.model = _na(model if isinstance(model, str) else (model or {}).get("name", ""))
-        v.body_type = _na(ld.get("bodyType", ""))
-        v.fuel_type = _na(ld.get("fuelType", ""))
-        v.drivetrain = _na(ld.get("driveWheelConfiguration", "")).replace(
-            "https://schema.org/", "").replace("Configuration", "")
-        v.transmission = _na(ld.get("vehicleTransmission", ""))
-        v.exterior_color = _na(ld.get("color", ""))
-        v.interior_color = _na(ld.get("vehicleInteriorColor", ""))
-        v.trim = _na(ld.get("vehicleConfiguration", ""))
-        v.vin = _na(ld.get("vehicleIdentificationNumber", ""))
-        v.year = _na(ld.get("modelDate", "") or ld.get("productionDate", ""))
+        fill("model", model if isinstance(model, str) else (model or {}).get("name", ""))
+        fill("body_type", ld.get("bodyType"))
+        fill("fuel_type", ld.get("fuelType"))
+        fill("drivetrain", _na(ld.get("driveWheelConfiguration", "")).replace(
+            "https://schema.org/", "").replace("http://schema.org/", "").replace("Configuration", ""))
+        fill("transmission", ld.get("vehicleTransmission"))
+        fill("exterior_color", ld.get("color"))
+        fill("interior_color", ld.get("vehicleInteriorColor"))
+        fill("trim", ld.get("vehicleConfiguration"))
+        fill("vin", ld.get("vehicleIdentificationNumber"))
+        fill("year", ld.get("modelDate") or ld.get("productionDate"))
         img = ld.get("image")
+        if isinstance(img, list) and img:
+            img = img[0]
+        if isinstance(img, dict):
+            img = img.get("url", "")
         if isinstance(img, str):
-            v.image_url = img
-        elif isinstance(img, list) and img:
-            v.image_url = img[0] if isinstance(img[0], str) else ""
-        if not v.fuel_type:
-            engines = ld.get("vehicleEngine")
-            if isinstance(engines, list) and engines:
-                e0 = engines[0] if isinstance(engines[0], dict) else {}
-                v.fuel_type = _na(e0.get("fuelType", ""))
-                if not v.engine:
-                    v.engine = _na(e0.get("engineType", ""))
-        v.extraction_notes = "json-ld"
+            fill("image_url", img)
+        engines = ld.get("vehicleEngine")
+        if isinstance(engines, list) and engines and isinstance(engines[0], dict):
+            fill("fuel_type", engines[0].get("fuelType"))
+            fill("engine", engines[0].get("engineType"))
+        notes.append("json-ld")
 
-    if not v.title:
-        title_tag = soup.find("title")
-        if title_tag:
-            v.title = title_tag.get_text(strip=True)
-    og_image = soup.find("meta", property="og:image")
-    if og_image and not v.image_url:
-        v.image_url = og_image.get("content", "")
+    # ---- 3. meta tags / title ---------------------------------------------
+    title_tag = soup.find("title")
+    if title_tag and not v.title:
+        v.title = clean_title(title_tag.get_text(strip=True))
+    elif v.title:
+        v.title = clean_title(v.title)
+    og_img = soup.find("meta", property="og:image")
+    if og_img and not v.image_url:
+        v.image_url = og_img.get("content", "")
+    og_title = soup.find("meta", property="og:title")
+    og_title = og_title.get("content", "") if og_title else ""
 
+    if is_sm360(html) or specs:
+        price, original = sm360_prices(soup, main_text_from_h1)
+        if price:
+            v.price = price             # visible selling price beats JSON-LD
+        v.original_price = original
+        y, mk, md = year_make_model(og_title or (h1.get_text(" ", strip=True) if h1 else ""),
+                                    url, detail_pattern)
+        v.year = v.year or y
+        v.make = v.make or mk
+        v.model = v.model or md
+
+    # ---- 4. regex fallback on the MAIN text only --------------------------
+    used_regex = False
     if not v.price:
-        pm = re.search(r"\$\s?[\d,]{4,7}", text)
+        pm = PRICE_RE.search(main_text_from_h1)
         if pm:
-            v.price = pm.group(0)
+            v.price = digits(pm.group(0)); used_regex = True
     if not v.mileage:
-        mm = re.search(r"([\d,]{3,7})\s?km", text, re.IGNORECASE)
+        mm = re.search(r"(\d{1,3}(?:[,\s\u00a0]\d{3})+|\d{3,7})\s?km\b", main_text_from_h1, re.IGNORECASE)
         if mm:
-            v.mileage = mm.group(1)
-    if not v.vin:
-        vinm = re.search(r"\bVIN[:\s]*([A-HJ-NPR-Z0-9]{11,17})\b", text, re.IGNORECASE)
-        if vinm:
-            v.vin = vinm.group(1)
+            v.mileage = mm.group(1); used_regex = True
+    if not valid_vin(v.vin):
+        vinm = re.search(r"\b(?:VIN|NIV)\s*[#:]?\s*([A-HJ-NPR-Z0-9]{17})\b", main_text, re.IGNORECASE)
+        v.vin = vinm.group(1) if vinm else ""
+        used_regex = used_regex or bool(vinm)
     if not v.stock_number:
         v.stock_number = regex_token_field(
-            text, "Stock is #", "Stock #", "Stock#", "Stock number", "Stock No")
-    if not v.transmission:
-        v.transmission = regex_field(text, "Transmission")
-    if not v.engine:
-        v.engine = regex_field(text, "Engine")
-    if not v.drivetrain:
-        v.drivetrain = regex_field(text, "Drivetrain")
-    if not v.body_type:
-        v.body_type = regex_field(text, "Bodystyle", "Body Style", "Body type")
+            main_text, "Stock is #", "Stock #", "Stock#", "Stock number", "Stock No",
+            "No. d'inventaire", "# d'inventaire")
+        used_regex = used_regex or bool(v.stock_number)
+    for attr, labels in (
+        ("transmission", ("Transmission",)),
+        ("engine", ("Engine", "Moteur")),
+        ("drivetrain", ("Drivetrain", "Rouage")),
+        ("body_type", ("Bodystyle", "Body Style", "Body type", "Carrosserie")),
+        ("exterior_color", ("Ext. Colors", "Ext. Color", "Exterior Colour",
+                            "Exterior Color", "Ext Color", "Couleur ext.")),
+        ("interior_color", ("Int. Colors", "Int. color", "Interior Colour",
+                            "Interior Color", "Int Color", "Couleur int.")),
+    ):
+        if not getattr(v, attr):
+            val = regex_field(main_text_from_h1, *labels)
+            if val:
+                setattr(v, attr, val); used_regex = True
     if not v.fuel_type:
-        v.fuel_type = regex_field(text, "Fuel", max_words=2)
-    if not v.exterior_color:
-        v.exterior_color = regex_field(
-            text, "Ext. Colors", "Ext. Color", "Exterior Colour", "Exterior Color", "Ext Color")
-    if not v.interior_color:
-        v.interior_color = regex_field(
-            text, "Int. Colors", "Int. color", "Interior Colour", "Interior Color", "Int Color")
+        v.fuel_type = regex_field(main_text_from_h1, "Fuel", "Carburant", max_words=3)
 
     if v.title and not (v.year and v.make and v.model):
-        ymm = re.match(r"(\d{4})\s+([A-Za-z\-]+)\s+([A-Za-z0-9\-]+)(.*)", clean_title(v.title))
+        ymm = re.match(r"(\d{4})\s+([A-Za-z\-]+)\s+([A-Za-z0-9\-]+)(.*)", v.title)
         if ymm:
             v.year = v.year or ymm.group(1)
             v.make = v.make or ymm.group(2)
             v.model = v.model or ymm.group(3)
             v.trim = v.trim or cap_trim(ymm.group(4))
 
-    if not v.extraction_notes:
-        v.extraction_notes = "regex-fallback"
-    elif "json-ld" in v.extraction_notes and (not v.stock_number or not v.transmission):
-        v.extraction_notes += "+regex-fallback"
+    # ---- normalise ----------------------------------------------------------
+    v.vin = valid_vin(v.vin)
+    v.mileage = digits(v.mileage)
+    v.price = digits(v.price)
+    v.stock_number = v.stock_number.strip(" #:")
+
+    # certified? (Honda/Toyota/etc. CPO badge, or "Certified/Certifié" in title/trim)
+    main_html = html
+    sim_html = SIMILAR_RE.search(html)
+    h1_pos = html.lower().find("<h1")
+    if sim_html:
+        main_html = html[max(h1_pos, 0):sim_html.start()]
+    if (re.search(r"<img[^>]+certified", main_html, re.IGNORECASE)
+            or re.search(r"certifi(?:ed|é|e)\b", f"{v.title} {v.trim}", re.IGNORECASE)):
+        v.certified = "yes"
+
+    if used_regex:
+        notes.append("regex-fallback")
+    v.extraction_notes = "+".join(notes) or "regex-fallback"
     return v
 
 
 def build_page_url(source_url: str, param: str, page_num: int) -> str:
-    """Re-issue the original URL with its existing query params intact,
-    overriding/adding only the pagination param. This preserves filters
-    like namedSorting=default&limit=12 that some SM360 sites require."""
     parsed = urlparse(source_url)
     query = parse_qs(parsed.query)
-    # drop any other page-like params so we don't send page=2&pageNumber=2
     for other in PAGE_PARAM_CANDIDATES:
         query.pop(other, None)
     query[param] = [str(page_num)]
-    new_query = urlencode(query, doseq=True)
-    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(query, doseq=True)}"
 
 
-def scrape_one_url(source_url: str, max_pages: int, log_fn, progress_fn) -> tuple:
-    """Scrape a single listing-page URL (plus its pagination), returning
-    (platform_name, list_of_Vehicle)."""
+# ==========================================================================
+# per-URL scrape
+# ==========================================================================
+def scrape_one_url(source_url: str, max_pages: int, log_fn, progress_fn,
+                   seen_vehicle_keys: set) -> tuple:
     domain = urlparse(source_url).netloc
     vehicles = []
+    scope = listing_scope(source_url)
 
-    # One Session per URL: reuses the TCP/TLS connection to the dealer site
-    # instead of doing a fresh (CPU-heavy) TLS handshake on every request.
-    with requests.Session() as session:
-        log_fn(f"Fetching listing page: {source_url}")
-        resp = get(source_url, session)
-        time.sleep(REQUEST_DELAY)
-        if resp is None:
-            log_fn(f"Could not fetch {source_url} (site unreachable or non-200 response).", is_err=True)
-            return None, vehicles
+    log_fn(f"Scraper {VERSION}")
+    log_fn(f"Fetching listing page: {source_url}")
+    resp = get(source_url)
+    time.sleep(REQUEST_DELAY)
+    if resp is None:
+        log_fn(f"Could not fetch the listing page: {last_error()}", is_err=True)
+        log_fn("Trying the dealer's sitemap directly instead...")
+        html = "sm360"          # assume SM360; the sitemap check below confirms it
+    else:
+        html = resp.text
+    platform, pattern, links = detect_platform_and_links(html, source_url)
+    links = {l for l in links if link_matches_scope(l, scope)}
+    sm360 = is_sm360(html)
 
-        platform, pattern, links = detect_platform_and_links(resp.text, source_url)
-        if not links:
-            log_fn("No vehicle links found on this page with any known platform "
-                   "pattern (SM360 .html, SM360 inventory-path, syncauto numeric-path, "
-                   "generic -idNNNN). This site may use a platform this tool doesn't "
-                   "recognize yet -- inspect a vehicle detail-page URL manually and "
-                   "add a pattern to DETAIL_URL_PATTERNS in app.py.", is_err=True)
-            return None, vehicles
+    # BUG FIX #4: SM360 listing pages render their vehicle cards with
+    # JavaScript, so the raw HTML contains 0 cars and ?page=N returns the
+    # same empty shell every time. Every SM360 site publishes an HTML
+    # sitemap (/en/sitemap, /fr/plan-du-site) listing EVERY in-stock new
+    # and used vehicle with its real detail URL -> use that.
+    if sm360:
+        platform = "sm360"
+        pattern = dict(DETAIL_URL_PATTERNS)["sm360-inventory-path"]
+        for sm_url in sm360_sitemap_urls(source_url):
+            log_fn(f"SM360 site: listing cards are JavaScript-rendered, reading sitemap {sm_url}")
+            r = get(sm_url)
+            time.sleep(REQUEST_DELAY)
+            if r is None:
+                log_fn(f"Sitemap not available: {last_error()}", is_err=True)
+                continue
+            sm_links = {l for l in find_detail_links_with_pattern(r.text, sm_url, pattern)
+                        if link_matches_scope(l, scope)}
+            listing_links = {l for l in links if pattern.search(l)}
+            links = sm_links | listing_links
+            if sm_links:
+                break
+        # the sitemap lists en+fr for the same car sometimes; keep one per id
+        by_id = {}
+        for l in sorted(links):
+            by_id.setdefault(stock_id_from_url(l, pattern) or l, l)
+        links = set(by_id.values())
 
-        log_fn(f"Detected platform: {platform} — found {len(links)} vehicle link(s) on the first page.")
+    if not links:
+        log_fn("No vehicle links found with any known platform pattern "
+               "(SM360 sitemap, SM360 .html, SM360 inventory-path, syncauto "
+               "numeric-path, generic -idNNNN).", is_err=True)
+        return platform, vehicles
 
-        # paginate, preserving other query params, trying each page-param name
+    desc = [scope["condition"] or "all", scope["make"], scope["model"],
+            "certified-only" if scope["certified"] else "",
+            "hybrid/EV-only" if scope["electrified"] else ""]
+    log_fn(f"Detected platform: {platform} — found {len(links)} vehicle link(s) "
+           f"[scope: {' / '.join(d for d in desc if d)}].")
+
+    # pagination only for non-SM360 (SM360 sitemap already has everything)
+    if not sm360:
+        first_page = set(links)
         for param in PAGE_PARAM_CANDIDATES:
-            stagnant = 0
-            found_any_for_param = False
+            stagnant, found_any = 0, False
             for page_num in range(2, max_pages + 1):
                 page_url = build_page_url(source_url, param, page_num)
-                resp = get(page_url, session)
+                r = get(page_url)
                 time.sleep(REQUEST_DELAY)
-                if resp is None:
+                if r is None:
                     break
-                new_links = find_detail_links_with_pattern(resp.text, page_url, pattern)
+                new_links = {l for l in find_detail_links_with_pattern(r.text, page_url, pattern)
+                             if link_matches_scope(l, scope)}
+                if new_links == first_page:
+                    log_fn(f"'{param}=' is ignored by this server (same cars as page 1).")
+                    break
                 before = len(links)
                 links |= new_links
                 if len(links) == before:
@@ -550,175 +827,100 @@ def scrape_one_url(source_url: str, max_pages: int, log_fn, progress_fn) -> tupl
                     if stagnant >= 2:
                         break
                 else:
-                    found_any_for_param = True
+                    found_any, stagnant = True, 0
                     log_fn(f"Page {page_num} ({param}={page_num}): {len(links)} total vehicle links so far")
-                    stagnant = 0
-            if found_any_for_param:
+            if found_any:
                 break
 
-        log_fn(f"Total unique vehicle pages to scrape: {len(links)}")
+    # cross-URL de-duplication within the batch
+    todo = []
+    for l in sorted(links):
+        key = (domain.lower(), stock_id_from_url(l, pattern) or l)
+        if key in seen_vehicle_keys:
+            continue
+        seen_vehicle_keys.add(key)
+        todo.append(l)
+    skipped = len(links) - len(todo)
+    log_fn(f"{len(links)} unique vehicle(s) on this listing; {skipped} already "
+           f"collected from an earlier URL in this batch; {len(todo)} to scrape.")
 
-        links_sorted = sorted(links)
-        total = len(links_sorted)
-        for i, url in enumerate(links_sorted, 1):
-            resp = get(url, session)
-            time.sleep(REQUEST_DELAY)
-            if resp is not None:
-                v = parse_detail_page(resp.text, url, domain, source_url, pattern)
+    total = len(todo)
+    dropped = 0
+    for i, url in enumerate(todo, 1):
+        r = get(url)
+        time.sleep(REQUEST_DELAY)
+        if r is not None:
+            v = parse_detail_page(r.text, url, domain, source_url, pattern)
+            if vehicle_matches_scope(v, scope):
                 vehicles.append(v)
-            progress_fn(i, total)
-
+            else:
+                dropped += 1
+        else:
+            log_fn(f"Could not fetch vehicle page {url}: {last_error()}", is_err=True)
+        progress_fn(i, total)
+    if dropped:
+        log_fn(f"{dropped} vehicle(s) dropped because they don't match this "
+               f"listing's filter (certified / hybrid-EV).")
     return platform, vehicles
 
 
 def run_batch_job(job_id: str, urls: list, max_pages: int):
+    q = JOBS[job_id]["queue"]
     url_jobs = JOBS[job_id]["url_jobs"]
     n_urls = len(urls)
+    seen_vehicle_keys = set()
+    seen_listings = {}
 
-    try:
-        for idx, source_url in enumerate(urls):
-            url_jobs[idx]["status"] = "running"
-            push_event(job_id, {"type": "url_start", "url_index": idx, "url": source_url,
-                                "overall_index": idx + 1, "overall_total": n_urls})
+    for idx, source_url in enumerate(urls):
+        url_jobs[idx]["status"] = "running"
+        q.put({"type": "url_start", "url_index": idx, "url": source_url,
+               "overall_index": idx + 1, "overall_total": n_urls})
 
-            def log_fn(msg, is_err=False, _idx=idx):
-                push_event(job_id, {"type": "log", "url_index": _idx,
-                                    "message": msg, "is_err": is_err})
+        def log_fn(msg, is_err=False, _idx=idx):
+            q.put({"type": "log", "url_index": _idx, "message": msg, "is_err": is_err})
 
-            def progress_fn(current, total, _idx=idx):
-                push_event(job_id, {"type": "progress", "url_index": _idx,
-                                    "current": current, "total": total})
+        def progress_fn(current, total, _idx=idx):
+            q.put({"type": "progress", "url_index": _idx, "current": current, "total": total})
 
-            try:
-                platform, vehicles = scrape_one_url(source_url, max_pages, log_fn, progress_fn)
-                url_jobs[idx]["vehicles"] = vehicles
-                url_jobs[idx]["platform"] = platform or "unknown"
-                url_jobs[idx]["status"] = "done" if vehicles else "error"
-                push_event(job_id, {"type": "url_done", "url_index": idx, "count": len(vehicles),
-                                    "platform": platform or "unknown"})
-            except Exception as e:
-                url_jobs[idx]["status"] = "error"
-                push_event(job_id, {"type": "log", "url_index": idx,
-                                    "message": f"ERROR: {e}", "is_err": True})
-                push_event(job_id, {"type": "url_done", "url_index": idx,
-                                    "count": 0, "platform": "error"})
-    finally:
-        # Always mark the job finished, even on an unexpected crash, so no
-        # stream is left waiting forever.
-        total_count = sum(len(uj["vehicles"]) for uj in url_jobs)
-        JOBS[job_id]["status"] = "done"
-        JOBS[job_id]["finished"] = time.time()
-        push_event(job_id, {"type": "done", "total_count": total_count})
+        # same listing pasted as ?page=1, ?page=2 ... -> scrape it once
+        key = listing_key(source_url)
+        if key in seen_listings:
+            first = seen_listings[key]
+            log_fn(f"Same listing as URL {first + 1} (only the page number differs) "
+                   f"— already fully covered, skipping.")
+            url_jobs[idx]["status"] = "skipped"
+            url_jobs[idx]["platform"] = url_jobs[first].get("platform") or "-"
+            q.put({"type": "url_done", "url_index": idx, "count": 0,
+                   "platform": url_jobs[idx]["platform"], "skipped": True,
+                   "duplicate_of": first + 1})
+            continue
+        seen_listings[key] = idx
 
+        try:
+            platform, vehicles = scrape_one_url(source_url, max_pages, log_fn,
+                                                progress_fn, seen_vehicle_keys)
+            url_jobs[idx]["vehicles"] = vehicles
+            url_jobs[idx]["platform"] = platform or "unknown"
+            url_jobs[idx]["status"] = "done" if vehicles else "error"
+            q.put({"type": "url_done", "url_index": idx, "count": len(vehicles),
+                   "platform": platform or "unknown"})
+        except Exception as e:
+            url_jobs[idx]["status"] = "error"
+            q.put({"type": "log", "url_index": idx, "message": f"ERROR: {e}", "is_err": True})
+            q.put({"type": "url_done", "url_index": idx, "count": 0, "platform": "error"})
 
-# --------------------------------------------------------------------------
-# "Send to Inventory" button.
-# Injected into index.html at render time so templates/index.html needs no
-# edits. It wraps window.fetch to notice the job_id returned by /api/scrape,
-# polls until the job reports "done", then enables the button.
-# --------------------------------------------------------------------------
-INVENTORY_BUTTON_SNIPPET = """
-<style>
-  #dt-inv-bar { position: fixed; right: 18px; bottom: 18px; z-index: 99999;
-    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    text-align: right; }
-  #dt-inv-btn { padding: 12px 20px; border: 0; border-radius: 8px;
-    background: #16a34a; color: #fff; font-size: 15px; font-weight: 600;
-    cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,.25); }
-  #dt-inv-btn:hover:not([disabled]) { background: #15803d; }
-  #dt-inv-btn[disabled] { background: #9ca3af; cursor: not-allowed;
-    box-shadow: none; }
-  #dt-inv-note { margin-top: 6px; font-size: 12px; color: #4b5563; }
-</style>
-<div id="dt-inv-bar" style="display:none">
-  <button id="dt-inv-btn" disabled>Send to Inventory</button>
-  <div id="dt-inv-note"></div>
-</div>
-<script>
-(function () {
-  var DASHBOARD = "__DASHBOARD_URL__";
-  var jobId = null, ready = false, poller = null;
-
-  var bar  = document.getElementById("dt-inv-bar");
-  var btn  = document.getElementById("dt-inv-btn");
-  var note = document.getElementById("dt-inv-note");
-
-  function watch(id) {
-    if (poller) { clearInterval(poller); poller = null; }
-    jobId = id;
-    ready = false;
-    bar.style.display = "block";
-    btn.disabled = true;
-    note.textContent = "Scraping running...";
-
-    poller = setInterval(function () {
-      // ?summary=1 -> server returns only status + count while running,
-      // not the full vehicle list, so polling stays cheap.
-      fetch("/api/inventory/" + id + "?summary=1")
-        .then(function (r) { return r.json(); })
-        .then(function (d) {
-          if (d.status === "done") {
-            clearInterval(poller); poller = null;
-            ready = d.count > 0;
-            btn.disabled = !ready;
-            note.textContent = d.count
-              ? d.count + " vehicles ready to send"
-              : "No vehicles found";
-          } else {
-            note.textContent = d.count + " vehicles so far...";
-          }
-        })
-        .catch(function () {});
-    }, 3000);
-  }
-
-  // The page's own script POSTs to /api/scrape; grab the job_id it returns.
-  var origFetch = window.fetch;
-  window.fetch = function () {
-    var args = arguments;
-    var p = origFetch.apply(this, args);
-    try {
-      var u = typeof args[0] === "string" ? args[0] : (args[0] && args[0].url) || "";
-      if (u.indexOf("/api/scrape") !== -1) {
-        p.then(function (res) {
-          res.clone().json().then(function (d) {
-            if (d && d.job_id) watch(d.job_id);
-          }).catch(function () {});
-        }).catch(function () {});
-      }
-    } catch (e) {}
-    return p;
-  };
-
-  btn.onclick = function () {
-    if (!jobId || !ready) return;
-    // A named window (instead of "_blank") reuses the same inventory tab on
-    // every send, so repeated scrapes don't pile up browser tabs.
-    var tab = window.open(
-      DASHBOARD + "/?import=" + encodeURIComponent(jobId) +
-      "&src=" + encodeURIComponent(window.location.origin),
-      "dreamtech_inventory"
-    );
-    if (tab) tab.focus();
-  };
-})();
-</script>
-"""
+    total_count = sum(len(uj["vehicles"]) for uj in url_jobs)
+    JOBS[job_id]["status"] = "done"
+    q.put({"type": "done", "total_count": total_count})
 
 
 @app.route("/")
 def index():
-    html = render_template("index.html")
-    snippet = INVENTORY_BUTTON_SNIPPET.replace("__DASHBOARD_URL__", DASHBOARD_URL)
-    if "</body>" in html:
-        return html.replace("</body>", snippet + "</body>", 1)
-    return html + snippet
+    return render_template("index.html")
 
 
 @app.route("/api/scrape", methods=["POST"])
 def api_scrape():
-    cleanup_old_jobs()
-
     data = request.get_json(force=True)
     raw_urls = data.get("urls", [])
     max_pages = int(data.get("max_pages", DEFAULT_MAX_PAGES))
@@ -735,19 +937,15 @@ def api_scrape():
         return jsonify({"error": "No valid URLs provided."}), 400
 
     job_id = str(uuid.uuid4())
-    with JOBS_LOCK:
-        JOBS[job_id] = {
-            "events": [],
-            "cond": threading.Condition(),
-            "status": "running",
-            "created": time.time(),
-            "finished": None,
-            "url_jobs": [
-                {"url": u, "domain": urlparse(u).netloc, "status": "pending",
-                 "platform": None, "vehicles": []}
-                for u in clean_urls
-            ],
-        }
+    JOBS[job_id] = {
+        "queue": queue.Queue(),
+        "status": "running",
+        "url_jobs": [
+            {"url": u, "domain": urlparse(u).netloc, "status": "pending",
+             "platform": None, "vehicles": []}
+            for u in clean_urls
+        ],
+    }
     t = threading.Thread(target=run_batch_job, args=(job_id, clean_urls, max_pages), daemon=True)
     t.start()
     return jsonify({"job_id": job_id, "urls": clean_urls})
@@ -759,34 +957,14 @@ def api_stream(job_id):
         return "Unknown job", 404
 
     def generate():
-        # Every stream keeps its OWN read position in the job's event list,
-        # so several tabs / reconnects never steal each other's messages.
-        pos = 0
+        q = JOBS[job_id]["queue"]
         while True:
-            job = JOBS.get(job_id)
-            if job is None:
-                return  # job was cleaned up
-            with job["cond"]:
-                if pos >= len(job["events"]):
-                    job["cond"].wait(timeout=STREAM_PING_SECONDS)
-                new_items = job["events"][pos:]
-                pos += len(new_items)
+            item = q.get()
+            yield f"data: {json.dumps(item)}\n\n"
+            if item.get("type") == "done":
+                break
 
-            if not new_items:
-                # Keep-alive comment: stops proxies from closing an idle
-                # connection, and lets the server notice a closed browser tab.
-                yield ": ping\n\n"
-                continue
-
-            for item in new_items:
-                yield f"data: {json.dumps(item)}\n\n"
-                if item.get("type") == "done":
-                    return
-
-    resp = Response(generate(), mimetype="text/event-stream")
-    resp.headers["Cache-Control"] = "no-cache"
-    resp.headers["X-Accel-Buffering"] = "no"  # disable proxy buffering
-    return resp
+    return Response(generate(), mimetype="text/event-stream")
 
 
 @app.route("/api/results/<job_id>")
@@ -811,43 +989,6 @@ def api_results(job_id):
         "status": job["status"],
         "summary": summary,
         "vehicles": all_vehicles,
-    })
-
-
-@app.route("/api/inventory/<job_id>")
-def api_inventory(job_id):
-    """Payload consumed by the DreamTech inventory dashboard.
-
-    Same vehicles as /api/results, but duplicates are collapsed on VIN
-    (falling back to the detail-page URL when a VIN is missing) so re-scraping
-    the same dealer updates rows instead of piling up copies.
-
-    With ?summary=1 only status + count are returned (used by the page's
-    3-second poller so it doesn't rebuild the whole list every time).
-    """
-    job = JOBS.get(job_id)
-    if not job:
-        return jsonify({"error": "Unknown job"}), 404
-
-    if request.args.get("summary") == "1":
-        count = sum(len(uj["vehicles"]) for uj in job["url_jobs"])
-        return jsonify({"job_id": job_id, "status": job["status"], "count": count})
-
-    deduped = {}
-    for uj in job["url_jobs"]:
-        for v in uj["vehicles"]:
-            d = asdict(v)
-            key = (d.get("vin") or "").strip().upper() or d.get("url")
-            deduped[key] = d
-
-    items = list(deduped.values())
-    return jsonify({
-        "job_id": job_id,
-        "status": job["status"],
-        "count": len(items),
-        "fields": CSV_FIELDNAMES,
-        "dedupe_key": "vin",
-        "items": items,
     })
 
 
@@ -952,7 +1093,7 @@ def api_download_csv(job_id):
         return "No data available for this job", 404
 
     buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=CSV_FIELDNAMES)
+    writer = csv.DictWriter(buf, fieldnames=CSV_FIELDNAMES, extrasaction="ignore")
     writer.writeheader()
     for v in all_vehicles:
         writer.writerow(asdict(v))
@@ -967,8 +1108,6 @@ def api_download_csv(job_id):
 
 
 if __name__ == "__main__":
-    # Render supplies PORT; locally it falls back to 5000.
-    port = int(os.environ.get("PORT", 5000))
-    debug = os.environ.get("FLASK_DEBUG", "1") == "1"
-    # threaded=True so the local dev server also handles several users at once
-    app.run(debug=debug, host="0.0.0.0", port=port, threaded=True)
+    port = int(os.environ.get("PORT", "5003").split()[0])
+    print(f"\n  Dealer scraper {VERSION}\n  Open http://127.0.0.1:{port}\n")
+    app.run(debug=True, port=port, threaded=True)
